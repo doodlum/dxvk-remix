@@ -34,7 +34,32 @@ namespace dxvk {
   }
 
 
+  // NV-DXVK start: API-only Remix host for D3D11
+  namespace {
+    dxvk::mutex      g_primarySwapChainMutex;
+    D3D11SwapChain*  g_primarySwapChain = nullptr;
+  }
+
+  bool D3D11SwapChain::ClaimPrimarySwapChain() {
+    std::lock_guard<dxvk::mutex> lock(g_primarySwapChainMutex);
+    if (g_primarySwapChain == nullptr) {
+      g_primarySwapChain = this;
+    }
+    return g_primarySwapChain == this;
+  }
+
+  void D3D11SwapChain::ReleasePrimarySwapChain() {
+    std::lock_guard<dxvk::mutex> lock(g_primarySwapChainMutex);
+    if (g_primarySwapChain == this) {
+      g_primarySwapChain = nullptr;
+    }
+  }
+  // NV-DXVK end
+
   D3D11SwapChain::~D3D11SwapChain() {
+    // NV-DXVK start: API-only Remix host for D3D11
+    ReleasePrimarySwapChain();
+    // NV-DXVK end
     m_device->waitForSubmission(&m_presentStatus);
     m_device->waitForIdle();
     
@@ -260,8 +285,22 @@ namespace dxvk {
     Com<ID3D11DeviceContext> deviceContext = nullptr;
     m_parent->GetImmediateContext(&deviceContext);
 
-    // Flush pending rendering commands before
     auto immediateContext = static_cast<D3D11ImmediateContext*>(deviceContext.ptr());
+
+    // NV-DXVK start: API-only Remix host for D3D11
+    // Only the first swap chain to present drives the ray-traced frame.
+    // Applications create several -- video, loading screens, editor panels --
+    // and each advancing the frame leaves the camera never settling.
+    const bool isPrimary = ClaimPrimarySwapChain();
+
+    // Before the flush, not after: EndFrame queues the composite and the flush
+    // submits it, so m_swapImage holds the traced frame when the blitter runs.
+    if (isPrimary) {
+      immediateContext->m_rtx.EndFrame(m_swapImage);
+    }
+    // NV-DXVK end
+
+    // Flush pending rendering commands before
     immediateContext->Flush();
 
     // Bump our frame id.
@@ -308,6 +347,12 @@ namespace dxvk {
       
       if (i + 1 >= SyncInterval)
         m_context->signal(m_frameLatencySignal, m_frameId);
+
+      // NV-DXVK start: API-only Remix host for D3D11
+      if (isPrimary) {
+        immediateContext->m_rtx.OnPresent(m_imageViews.at(imageIndex)->image());
+      }
+      // NV-DXVK end
 
       SubmitPresent(immediateContext, sync, i);
     }

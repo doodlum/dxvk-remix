@@ -15,6 +15,9 @@ namespace dxvk {
     const Rc<DxvkDevice>&         Device,
           DxvkCsChunkFlags        CsFlags)
   : D3D11DeviceChild<ID3D11DeviceContext4>(pParent),
+    // NV-DXVK start: API-only Remix host for D3D11
+    m_rtx       (this),
+    // NV-DXVK end
     m_contextExt(this),
     m_annotation(this),
     m_multithread(this, false),

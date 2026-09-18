@@ -116,6 +116,11 @@ namespace dxvk {
 
     HRESULT PresentImage(UINT SyncInterval);
 
+    // NV-DXVK start: API-only Remix host for D3D11
+    bool ClaimPrimarySwapChain();
+    void ReleasePrimarySwapChain();
+    // NV-DXVK end
+
     void SubmitPresent(
             D3D11ImmediateContext*  pContext,
       const vk::PresenterSync&      Sync,

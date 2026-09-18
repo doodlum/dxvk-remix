@@ -12,6 +12,9 @@
 #include "d3d11_context_ext.h"
 #include "d3d11_context_state.h"
 #include "d3d11_device_child.h"
+// NV-DXVK start: API-only Remix host for D3D11
+#include "d3d11_rtx.h"
+// NV-DXVK end
 #include "d3d11_texture.h"
 
 namespace dxvk {
@@ -689,6 +692,13 @@ namespace dxvk {
     D3D10DeviceLock LockContext() {
       return m_multithread.AcquireLock();
     }
+
+  public:
+
+    // NV-DXVK start: API-only Remix host for D3D11
+    // Public so the swap chain can drive frame boundaries, as the D3D9 one does.
+    D3D11Rtx                    m_rtx;
+    // NV-DXVK end
 
   protected:
     
