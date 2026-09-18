@@ -31,6 +31,39 @@
 
 // Note: These material ranges and defaults should be kept in sync with the MDL ranges to prevent mismatching between how data is clamped.
 
+namespace dxvk {
+struct NativeEffectMaterialData {
+  uint64_t identity = 0;
+  TextureRef palette;
+  Rc<DxvkSampler> paletteSampler;
+  uint16_t srgbMask = 0;
+  // UV offset/scale, base RGBA, falloff[4], scale, property alpha, soft depth,
+  // lighting influence, external RGB, flags. Mutated only on render stream.
+  std::array<float, 20> parameters{};
+};
+// Native animation parameters are mutated ONLY on the render command stream.
+// The stable identity is intentional: scrolling does not create new materials.
+struct NativeWaterMaterialData {
+  uint64_t identity = 0;
+  std::array<TextureRef, 4> extraNormals; // normal2/3, flow atlas, flow normal
+  Rc<DxvkSampler> flowSampler;
+  // scale[3], amplitude[3], scroll[6], projected-to-authored UV[6], cell[4], signed dimension, clock, falloff
+  std::array<float, 26> parameters{};
+};
+// API-only extension, deliberately outside the USD parameter/64-bit dirty mask.
+struct NativeLandscapeMaterialData {
+  std::array<TextureRef, 5> albedo;
+  std::array<TextureRef, 5> normal;
+  uint16_t srgbMask = 0;
+  XXH64_hash_t hash() const {
+    XXH64_hash_t h = srgbMask;
+    for (const auto& texture : albedo) { const auto v = texture.getImageHash(); h = XXH64(&v, sizeof(v), h); }
+    for (const auto& texture : normal) { const auto v = texture.getImageHash(); h = XXH64(&v, sizeof(v), h); }
+    return h;
+  }
+};
+}
+
 // clang-format off
 #define LIST_OPAQUE_MATERIAL_TEXTURES(X) \
   /*Parameter Name,                          USD Token String,                     Type,       UNUSED...   Default Value */ \
@@ -250,6 +283,9 @@ struct name##Data {                                                             
                                                                                                      \
   void merge(const name##Data& input)  {                                                             \
     X_PARAMS(WRITE_PARAMETER_MERGE)                                                                  \
+    if (!m_nativeEffect) m_nativeEffect = input.m_nativeEffect;                                       \
+    if (!m_nativeLandscape) m_nativeLandscape = input.m_nativeLandscape;                              \
+    if (!m_nativeWater) m_nativeWater = input.m_nativeWater;                                          \
     updateCachedHash();                                                                              \
   }                                                                                                  \
                                                                                                      \
@@ -272,6 +308,18 @@ struct name##Data {                                                             
   const bool getIgnoreAlphaChannel() const {                                                         \
     return m_ignoreAlphaChannelOverride;                                                             \
   }                                                                                                  \
+  void setNativeEffect(std::shared_ptr<const NativeEffectMaterialData> value) {                       \
+    m_nativeEffect = std::move(value); updateCachedHash();                                            \
+  }                                                                                                \
+  const auto& getNativeEffect() const { return m_nativeEffect; }                                      \
+  void setNativeLandscape(std::shared_ptr<const NativeLandscapeMaterialData> value) {                 \
+    m_nativeLandscape = std::move(value); updateCachedHash();                                         \
+  }                                                                                                  \
+  const auto& getNativeLandscape() const { return m_nativeLandscape; }                                \
+  void setNativeWater(std::shared_ptr<const NativeWaterMaterialData> value) {                         \
+    m_nativeWater = std::move(value); updateCachedHash();                                             \
+  }                                                                                                  \
+  const auto& getNativeWater() const { return m_nativeWater; }                                        \
                                                                                                      \
 private:                                                                                             \
                                                                                                      \
@@ -294,6 +342,9 @@ private:                                                                        
     XXH64_hash_t h = 0;                                                                              \
     X_TEXTURES(WRITE_TEXTURE_HASH)                                                                   \
     X_CONSTANTS(WRITE_CONSTANT_HASH)                                                                 \
+    if (m_nativeEffect) { const auto v = m_nativeEffect->identity; h = XXH64(&v, sizeof(v), h); }        \
+    if (m_nativeLandscape) { const auto v = m_nativeLandscape->hash(); h = XXH64(&v, sizeof(v), h); }    \
+    if (m_nativeWater) { const auto v = m_nativeWater->identity; h = XXH64(&v, sizeof(v), h); }          \
     m_cachedHash = h;                                                                                \
   }                                                                                                  \
                                                                                                      \
@@ -307,6 +358,9 @@ private:                                                                        
   XXH64_hash_t m_cachedHash { 0 };                                                                   \
   Rc<DxvkSampler> m_samplerOverride = nullptr;                                                       \
   bool m_ignoreAlphaChannelOverride = false;                                                         \
+  std::shared_ptr<const NativeEffectMaterialData> m_nativeEffect;                                     \
+  std::shared_ptr<const NativeLandscapeMaterialData> m_nativeLandscape;                                \
+  std::shared_ptr<const NativeWaterMaterialData> m_nativeWater;                                        \
 };
 
 namespace dxvk {
