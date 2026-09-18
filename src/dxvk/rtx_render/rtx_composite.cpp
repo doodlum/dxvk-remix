@@ -378,7 +378,14 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT,
       ctx->useRayReconstruction() ? rtOutput.m_rayReconstructionHitDistance.view(Resources::AccessType::Write) : nullptr, nullptr);
     const DomeLightArgs& domeLightArgs = sceneManager.getLightManager().getDomeLightArgs();
-    ctx->bindResourceSampler(COMPOSITE_SKY_LIGHT_TEXTURE, linearSampler);
+    // A dome light's texture is equirectangular, so its horizontal axis is
+    // continuous: clamping it leaves a visible seam where the panorama wraps.
+    // Vertical stays clamped, where the poles genuinely end.
+    Rc<DxvkSampler> latLongSampler = ctx->getResourceManager().getSampler(
+      VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST,
+      VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+    ctx->bindResourceSampler(COMPOSITE_SKY_LIGHT_TEXTURE, latLongSampler);
     if (domeLightArgs.active && domeLightArgs.textureIndex != BINDING_INDEX_INVALID) {
       RtxTextureManager& texManager = ctx->getCommonObjects()->getTextureManager();
       const TextureRef& domeLightTex = texManager.getTextureTable()[domeLightArgs.textureIndex];

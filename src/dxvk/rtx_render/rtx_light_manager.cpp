@@ -548,6 +548,13 @@ namespace dxvk {
           m_gpuDomeLightArgs.worldToLightTransform = activeDomeLight.worldToLight;
         }
       }
+
+      if ((device()->getCurrentFrameId() % 120u) == 7u) {
+        Logger::info(str::format("[RTX.dome] registered=", m_externalDomeLights.size(),
+          " instanced=", m_externalActiveDomeLight != nullptr,
+          " active=", m_gpuDomeLightArgs.active,
+          " textureIndex=", m_gpuDomeLightArgs.textureIndex));
+      }
     }
 
     // Reset external active light list.

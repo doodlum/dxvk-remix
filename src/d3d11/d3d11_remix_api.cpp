@@ -832,14 +832,16 @@ extern "C" {
         domeLight.worldToLight = inverse(cTransform);
         domeLight.texture = dxvk::TextureRef { cView };
 
-        // Keeps the image resident for the frame that samples it.
-        uint32_t unused;
-        auto& sceneManager = ctx->getCommonObjects()->getSceneManager();
-        sceneManager.trackTexture(domeLight.texture, unused, true, true);
-
-        auto& lightManager = sceneManager.getLightManager();
+        // The image is not pinned here: LightManager::prepareSceneData tracks
+        // the active dome's texture every frame and takes its bindless index
+        // from that, so pinning again would only touch the cache twice.
+        auto& lightManager = ctx->getCommonObjects()->getSceneManager().getLightManager();
         lightManager.addExternalDomeLight(skyHandle, domeLight);
         lightManager.addExternalLightInstance(skyHandle);
+
+        if ((ctx->getDevice()->getCurrentFrameId() % 120u) == 3u) {
+          dxvk::Logger::info("[RTX.dome] host submitted a sky image");
+        }
       });
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
