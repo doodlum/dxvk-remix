@@ -12,7 +12,7 @@ dxgi_src = [
   'dxgi_swapchain.cpp',
 ]
 
-dxgi_dll = shared_library('dxgi'+dll_ext, dxgi_src, dxgi_res,
+dxgi_dll = shared_library('dxvk_dxgi'+dll_ext, dxgi_src, dxgi_res,
   name_prefix         : '',
   dependencies        : [ dxvk_dep ],
   include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths ],

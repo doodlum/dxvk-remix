@@ -1,4 +1,4 @@
-LIBRARY D3D11.DLL
+LIBRARY dxvk_d3d11.dll
 EXPORTS  
     D3D11CoreCreateDevice @18
     D3D11CreateDevice @22
