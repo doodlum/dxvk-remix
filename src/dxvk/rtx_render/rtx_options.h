@@ -566,6 +566,12 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx", DLSSProfile, qualityDLSS, DLSSProfile::Auto, "Adjusts internal DLSS scaling factor, trades quality for performance.",
                     args.environment = "RTX_QUALITY_DLSS",
                     args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx", DLSSProfile, qualityDLSSOverride, DLSSProfile::Invalid,
+                    "Host-chosen DLSS profile. The graphics and DLSS presets write qualityDLSS into a derived layer at startup, "
+                    "which outranks the config API, so an embedding host cannot select a profile through qualityDLSS. This option "
+                    "is written by nothing else; when it is not Invalid it selects the profile instead.",
+                    args.environment = "RTX_QUALITY_DLSS_OVERRIDE",
+                    args.flags = RtxOptionFlags::UserSetting);
     // Note: All ray tracing modes depend on the rtx.raytraceModePreset option as they may be overridden by automatic defaults for a specific vendor if the preset is set to Auto. Set
     // to Custom to ensure these settings are not overridden.
     //RenderPassVolumeIntegrateRaytraceMode renderPassVolumeIntegrateRaytraceMode = RenderPassVolumeIntegrateRaytraceMode::RayQuery;

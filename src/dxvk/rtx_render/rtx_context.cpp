@@ -239,11 +239,21 @@ namespace dxvk {
   VkExtent3D RtxContext::setDownscaleExtent(const VkExtent3D& upscaleExtent) {
     ScopedCpuProfileZone();
     VkExtent3D downscaleExtent;
+    // NV-DXVK start: host-selectable DLSS profile
+    // The graphics and DLSS presets write qualityDLSS into a derived layer at
+    // startup, which outranks anything a host sets through the config API, so
+    // the profile cannot be chosen from outside through that option. The
+    // override is written by nothing else and is therefore the host's control.
+    const auto requestedProfile = [] {
+      const auto override = RtxOptions::qualityDLSSOverride();
+      return override == DLSSProfile::Invalid ? RtxOptions::qualityDLSS() : override;
+    };
+    // NV-DXVK end
     if (shouldUseDLSS()) {
       DxvkDLSS& dlss = m_common->metaDLSS();
       uint32_t displaySize[2] = { upscaleExtent.width, upscaleExtent.height };
       uint32_t renderSize[2];
-      dlss.setSetting(displaySize, RtxOptions::qualityDLSS(), renderSize);
+      dlss.setSetting(displaySize, requestedProfile(), renderSize);
       downscaleExtent.width = renderSize[0];
       downscaleExtent.height = renderSize[1];
       downscaleExtent.depth = 1;
@@ -251,7 +261,7 @@ namespace dxvk {
       DxvkRayReconstruction& rayReconstruction = m_common->metaRayReconstruction();
       uint32_t displaySize[2] = { upscaleExtent.width, upscaleExtent.height };
       uint32_t renderSize[2];
-      rayReconstruction.setSettings(displaySize, RtxOptions::qualityDLSS(), renderSize);
+      rayReconstruction.setSettings(displaySize, requestedProfile(), renderSize);
       downscaleExtent.width = renderSize[0];
       downscaleExtent.height = renderSize[1];
       downscaleExtent.depth = 1;
@@ -286,6 +296,19 @@ namespace dxvk {
   void RtxContext::resetScreenResolution(const VkExtent3D& upscaleExtent) {
     // Calculate extents based on if DLSS is enabled or not
     const VkExtent3D downscaleExtent = setDownscaleExtent(upscaleExtent);
+
+    // NV-DXVK start: drain the presenter before replacing its resources
+    // Nothing may be interpolating while the ray-tracing outputs are replaced.
+    // The frame-generation presenter runs its own present and pacer threads,
+    // holding this frame's motion vectors and depth and an NGX feature sized to
+    // the old render extent; the resize below both replaces those resources and
+    // marks the DLFG context dirty, which re-initialises that feature. Changing
+    // the DLSS profile while it was running killed the process every time.
+    // Draining the presenter first makes the resize the only thing touching
+    // them. Resolution changes are rare, so the wait costs nothing in steady
+    // state.
+    m_device->synchronizePresenter();
+    // NV-DXVK end
 
     // Resize the RT screen dependant buffers (if needed)
     getResourceManager().onResize(this, downscaleExtent, upscaleExtent);
