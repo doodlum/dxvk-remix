@@ -2515,6 +2515,69 @@ namespace dxvk {
 
   static_assert(std::is_same_v< decltype(RtSurface::objectPickingValue), ObjectPickingValue>);
 
+
+  void SceneManager::setRetainedExternalDraw(uint64_t handle, ExternalDrawState&& state) {
+    const Matrix4 absolute = state.drawCall.getTransformData().objectToWorld;
+
+    const auto found = m_retainedExternalIndex.find(handle);
+    if (found != m_retainedExternalIndex.end()) {
+      auto& entry = m_retainedExternalDraws[found->second];
+      entry.absoluteObjectToWorld = absolute;
+      entry.state = std::move(state);
+      return;
+    }
+
+    m_retainedExternalIndex.emplace(handle, m_retainedExternalDraws.size());
+    m_retainedExternalDraws.push_back(RetainedExternalDraw { handle, std::move(state), absolute });
+  }
+
+  void SceneManager::setRetainedExternalDrawTransform(uint64_t handle, const Matrix4& objectToWorld) {
+    const auto found = m_retainedExternalIndex.find(handle);
+    if (found == m_retainedExternalIndex.end()) {
+      return;
+    }
+    // Only the placement moved; the registered description still stands.
+    m_retainedExternalDraws[found->second].absoluteObjectToWorld = objectToWorld;
+  }
+
+  void SceneManager::removeRetainedExternalDraw(uint64_t handle) {
+    const auto found = m_retainedExternalIndex.find(handle);
+    if (found == m_retainedExternalIndex.end()) {
+      return;
+    }
+    // The instance itself is left to age out: it is no longer replayed, so the
+    // ordinary garbage collection that retires unseen instances collects it.
+    const size_t index = found->second;
+    const size_t last = m_retainedExternalDraws.size() - 1;
+    if (index != last) {
+      m_retainedExternalDraws[index] = std::move(m_retainedExternalDraws[last]);
+      m_retainedExternalIndex[m_retainedExternalDraws[index].handle] = index;
+    }
+    m_retainedExternalDraws.pop_back();
+    m_retainedExternalIndex.erase(found);
+  }
+
+  void SceneManager::submitRetainedExternalDraws(const Rc<DxvkContext>& ctx) {
+    ScopedCpuProfileZone();
+
+    for (auto& entry : m_retainedExternalDraws) {
+      // submitExternalDraw consumes the state it is given -- it moves the
+      // instancing transforms out and overwrites the geometry per submesh -- so
+      // the replay hands it a copy and the registration survives for the next
+      // frame.
+      auto replay = std::make_unique<ExternalDrawState>(entry.state);
+
+      // Rebasing happens here rather than in the host so that the host can keep
+      // registering stable absolute transforms as the camera moves.
+      Matrix4& objectToWorld = replay->drawCall.modifyTransformData().objectToWorld;
+      objectToWorld = entry.absoluteObjectToWorld;
+      objectToWorld[3].x -= m_retainedSceneOrigin.x;
+      objectToWorld[3].y -= m_retainedSceneOrigin.y;
+      objectToWorld[3].z -= m_retainedSceneOrigin.z;
+
+      submitExternalDraw(ctx, std::move(replay));
+    }
+  }
   void SceneManager::submitExternalDraw(const Rc<DxvkContext>& ctx, std::unique_ptr<ExternalDrawState> pstate) {
     ScopedCpuProfileZone();
 

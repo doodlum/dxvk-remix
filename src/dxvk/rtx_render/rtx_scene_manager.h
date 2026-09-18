@@ -54,6 +54,8 @@
 #include "rtx_particle_system.h"
 #include <d3d9types.h>
 
+
+
 namespace dxvk 
 {
 class DxvkContext;
@@ -117,6 +119,8 @@ struct ExternalDrawState {
   XXH64_hash_t computeExternalDrawIdentityHash() const;
 };
 
+
+
 // Scene manager is a super manager, it's the interface between rendering and world state
 // along with managing the operation of other caches, scene manager also manages the cache
 // directly for "SceneObject"'s - which are "unique meshes/geometry", which map 1-to-1 with
@@ -136,6 +140,24 @@ public:
 
   void submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData);
   void submitExternalDraw(const Rc<DxvkContext>& ctx, std::unique_ptr<ExternalDrawState> state);
+
+  // Host-retained draws. A host that describes a scene through the Remix API
+  // would otherwise re-send every instance every frame: for Skyrim that is
+  // thousands of calls, each taking the API lock, converting a draw state and
+  // queueing a command-stream lambda, all on the host's own thread. Instead it
+  // registers a draw once, reports only genuine changes, and asks for one
+  // replay per frame.
+  void setRetainedExternalDraw(uint64_t handle, ExternalDrawState&& state);
+  void setRetainedExternalDrawTransform(uint64_t handle, const Matrix4& objectToWorld);
+  void removeRetainedExternalDraw(uint64_t handle);
+  void submitRetainedExternalDraws(const Rc<DxvkContext>& ctx);
+  size_t retainedExternalDrawCount() const { return m_retainedExternalDraws.size(); }
+
+  // Where the host has placed the origin of the coordinates it registers.
+  // Registered transforms are absolute, so the replay rebases them: the host
+  // keeps sending stable transforms as the camera moves, and the scene stays
+  // near the origin where float precision is good.
+  void setRetainedSceneOrigin(const Vector3& origin) { m_retainedSceneOrigin = origin; }
   void setStartInMediumMaterial(const MaterialData& translucentMaterial);
   void clearStartInMediumMaterial();
 
@@ -448,6 +470,18 @@ private:
   std::unordered_map<XXH64_hash_t, uint32_t> m_currentFrameMeshHashes;
 
   DrawCallTracker m_drawCallTracker;
+
+  // A draw the host registered once and expects replayed every frame until it
+  // says otherwise. The host's transform is kept apart from the state because
+  // the replay rewrites the state's copy in place to rebase it.
+  struct RetainedExternalDraw {
+    uint64_t handle = 0;
+    ExternalDrawState state {};
+    Matrix4 absoluteObjectToWorld;
+  };
+  std::vector<RetainedExternalDraw> m_retainedExternalDraws;
+  std::unordered_map<uint64_t, size_t> m_retainedExternalIndex;
+  Vector3 m_retainedSceneOrigin { 0.f, 0.f, 0.f };
 };
 
 }  // namespace nvvk

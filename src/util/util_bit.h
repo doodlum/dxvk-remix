@@ -352,3 +352,21 @@ namespace dxvk::bit {
 
   };
 }
+
+// NV-DXVK start: shared by the D3D9 and D3D11 frontends
+namespace dxvk {
+
+  // Moves the elements selected by Mask down to the front of pData, preserving
+  // order, and returns how many there are.
+  template<typename T>
+  UINT CompactSparseList(T* pData, UINT Mask) {
+    uint32_t count = 0;
+
+    for (uint32_t id : bit::BitMask(Mask))
+      pData[count++] = pData[id];
+
+    return count;
+  }
+
+}
+// NV-DXVK end

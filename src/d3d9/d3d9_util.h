@@ -196,16 +196,6 @@ namespace dxvk {
     }
   }
 
-  template<typename T>
-  UINT CompactSparseList(T* pData, UINT Mask) {
-    uint32_t count = 0;
-
-    for (uint32_t id : bit::BitMask(Mask))
-      pData[count++] = pData[id];
-
-    return count;
-  }
-
   bool IsDepthFormat(D3D9Format Format);
 
   inline bool operator == (const D3DVIEWPORT9& a, const D3DVIEWPORT9& b) {

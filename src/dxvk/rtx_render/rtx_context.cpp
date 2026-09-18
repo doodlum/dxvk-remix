@@ -1042,6 +1042,26 @@ namespace dxvk {
     getSceneManager().submitExternalDraw(this, std::move(state));
   }
 
+  void RtxContext::setRetainedExternalGeometry(uint64_t handle, ExternalDrawState&& state) {
+    getSceneManager().setRetainedExternalDraw(handle, std::move(state));
+  }
+
+  void RtxContext::setRetainedExternalGeometryTransform(uint64_t handle, const Matrix4& objectToWorld) {
+    getSceneManager().setRetainedExternalDrawTransform(handle, objectToWorld);
+  }
+
+  void RtxContext::removeRetainedExternalGeometry(uint64_t handle) {
+    getSceneManager().removeRetainedExternalDraw(handle);
+  }
+
+  void RtxContext::commitRetainedExternalGeometry() {
+    getSceneManager().submitRetainedExternalDraws(this);
+  }
+
+  void RtxContext::setRetainedExternalSceneOrigin(const Vector3& origin) {
+    getSceneManager().setRetainedSceneOrigin(origin);
+  }
+
   static uint32_t jenkinsHash(uint32_t a) {
     // http://burtleburtle.net/bob/hash/integer.html
     a = (a + 0x7ed55d16) + (a << 12);

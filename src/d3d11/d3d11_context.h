@@ -28,6 +28,7 @@ namespace dxvk {
     // NV-DXVK start: API-only Remix host for D3D11
     // Needed in order to call EmitCs for the frame-boundary commands
     friend class D3D11Rtx;
+    friend struct D3D11RemixApiAccess;
     // NV-DXVK end
 
     constexpr static VkDeviceSize StagingBufferSize = 4ull << 20;

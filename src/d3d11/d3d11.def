@@ -1,5 +1,13 @@
 LIBRARY dxvk_d3d11.dll
 EXPORTS  
+    remixapi_dxvk_RegisterD3D11Device
+    csRemixApplyGraphicsPreset
+    csRemixCreateRetainedInstance
+    csRemixDestroyRetainedInstance
+    csRemixDrawRetainedInstances
+    csRemixRender
+    csRemixUpdateRetainedInstance
+    csRemixUpdateRetainedInstanceTransform
     D3D11CoreCreateDevice @18
     D3D11CreateDevice @22
     D3D11CreateDeviceAndSwapChain @23

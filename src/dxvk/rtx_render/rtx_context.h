@@ -112,6 +112,11 @@ namespace dxvk {
 
     void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState);
     void commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state);
+    void setRetainedExternalGeometry(uint64_t handle, ExternalDrawState&& state);
+    void setRetainedExternalGeometryTransform(uint64_t handle, const Matrix4& objectToWorld);
+    void removeRetainedExternalGeometry(uint64_t handle);
+    void commitRetainedExternalGeometry();
+    void setRetainedExternalSceneOrigin(const Vector3& origin);
 
     static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter);
 
