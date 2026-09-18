@@ -314,6 +314,12 @@ struct SkinningData {
 // Stores the geometry data representing a raytracable object
 // Valid until the object is destroyed.
 struct RaytraceGeometry {
+  // Set by a host that submits geometry through the Remix API. Skyrim stores
+  // normals in model space and authors its own vertex normals, and its terrain
+  // carries per-vertex blend weights for a five-layer material.
+  bool modelSpaceNormals = false;
+  bool preserveVertexNormals = false;
+  bool nativeLandscape = false;
   // Cached hashes from draw call on last update
   GeometryHashes hashes;
 
@@ -358,6 +364,15 @@ struct RaytraceGeometry {
 // WARNING: Usage is undefined after the drawcall this was 
 //          generated from has finished executing on the GPU
 struct RasterGeometry {
+  // Set by a host that submits geometry through the Remix API. With
+  // modelSpaceNormals the normal buffer holds a nine-float basis rather than a
+  // normal. Expanded grass repeats one prototype's topology per placement.
+  bool modelSpaceNormals = false;
+  bool preserveVertexNormals = false;
+  bool nativeLandscape = false;
+  bool nativeGrass = false;
+  bool nativeGrassHasWind = false;
+  uint32_t nativeGrassPrototypeTriangles = 0;
   GeometryHashes hashes;
   Future<GeometryHashes> futureGeometryHashes;
 
@@ -593,6 +608,9 @@ struct DrawCallTransforms {
   Vector4 clipPlane{ 0.f };
   TexGenMode texgenMode = TexGenMode::None;
   std::shared_ptr<const std::vector<Matrix4>> instancesToObject;
+  // Per-placement colour and, for grass, the deformed vertex buffers a host
+  // submitted alongside the placements. Null for an ordinary draw.
+  std::shared_ptr<NativeInstanceSet> nativeInstanceSet;
 
   void sanitize() {
     if (objectToWorld[3][3] == 0.f) objectToWorld[3][3] = 1.f;

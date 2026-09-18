@@ -24,6 +24,7 @@
 #include <memory>
 #include <variant>
 
+#include "../dxvk_buffer.h"
 #include "rtx_texture.h"
 #include "rtx_option.h"
 #include "../../util/util_color.h"
@@ -39,6 +40,33 @@
 #include "dxvk_constant_state.h"
 
 namespace dxvk {
+// A placement snapshot published by a host through the Remix API. The CPU data
+// is complete before publication and never mutated afterwards, so the render
+// command stream is free to build the GPU copies from it once. For grass the
+// host also submits deformed vertices: wind rewrites those buffers' contents
+// without disturbing the placements they were grown from.
+struct NativeInstanceRecord {
+  Matrix4 transform;
+  uint32_t tFactor = 0xffffffff;
+  uint32_t applyColor = 0;
+  uint32_t padding[2] = {};
+};
+static_assert(sizeof(NativeInstanceRecord) == 80);
+
+struct NativeInstanceSet {
+  std::vector<Matrix4> transforms;
+  std::vector<NativeInstanceRecord> records;
+  uint64_t contentHash = 0;
+  Rc<DxvkBuffer> gpuRecords;
+  bool hasGrassPhases = false;
+  Rc<DxvkBuffer> grassVertices;
+  Rc<DxvkBuffer> grassIndices;
+  uint64_t grassMeshHash = 0;
+  uint64_t grassWindHash = 0;
+  Vector3 grassBoundsMin;
+  Vector3 grassBoundsMax;
+};
+
 // Surfaces
 
 // Todo: Compute size directly from sizeof of GPU structure (by including it), for now computed by sum of members manually
@@ -118,7 +146,11 @@ struct RtSurface {
     uint16_t flags0 = 0;
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
-    // NOTE: Spare flags bits here
+    // Bits 2-4 are spare. 5-7 describe geometry submitted through the Remix
+    // API and are read by Surface in surface.h.
+    flags0 |= modelSpaceNormals ?     (1 << 5) : 0;
+    flags0 |= preserveVertexNormals ? (1 << 6) : 0;
+    flags0 |= nativeLandscape ?       (1 << 7) : 0;
 
     writeGPUHelper(data, offset, flags0);
 
@@ -258,7 +290,17 @@ struct RtSurface {
 
     writeGPUHelper(data, offset, textureSpritesheetData);
 
-    writeGPUHelper(data, offset, tFactor);
+    // A host may colour each placement of an instanced draw individually, in
+    // which case the per-placement value replaces the draw's own.
+    uint32_t instanceFactor = tFactor;
+    if (nativeInstanceSet && surfaceIndex != SIZE_MAX && surfaceIndexOfFirstInstance != SIZE_MAX
+        && surfaceIndex >= surfaceIndexOfFirstInstance) {
+      const size_t index = surfaceIndex - surfaceIndexOfFirstInstance;
+      if (index < nativeInstanceSet->records.size() && nativeInstanceSet->records[index].applyColor) {
+        instanceFactor = nativeInstanceSet->records[index].tFactor;
+      }
+    }
+    writeGPUHelper(data, offset, instanceFactor);
 
     std::uint32_t textureFlags = 0;
 
@@ -311,6 +353,10 @@ struct RtSurface {
   uint32_t normalOffset = 0;
   uint32_t normalStride = 0;
   VkFormat normalFormat = VK_FORMAT_UNDEFINED;
+  // Mirrors of the geometry flags, written into flags0 above.
+  bool modelSpaceNormals = false;
+  bool preserveVertexNormals = false;
+  bool nativeLandscape = false;
 
   uint32_t texcoordBufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t texcoordOffset = 0;
@@ -484,6 +530,7 @@ struct RtSurface {
   // Some API-provided instance transform arrays are not owned by an AssetReplacement and may be destroyed before the
   // next full scene clear, so surfaces retain shared ownership of the transform data they reference.
   std::shared_ptr<const std::vector<Matrix4>> instancesToObject;
+  std::shared_ptr<NativeInstanceSet> nativeInstanceSet;
   // on the GPU, multiple copies of this surface with different transforms will exist.  They will be in a continuous block, starting at surfaceIndexOfFirstInstance.
   size_t surfaceIndexOfFirstInstance = SIZE_MAX;
 };
