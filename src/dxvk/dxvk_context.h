@@ -41,7 +41,16 @@ namespace dxvk {
    * recorded.
    */
   class DxvkContext : public RcObject {
-    constexpr static VkDeviceSize StagingBufferSize = 4ull << 20;
+    // NV-DXVK start: staging ring sized for an API-submitted scene
+    // The staging ring is recreated whole -- a fresh host-visible allocation --
+    // whenever a frame's uploads run past it. A host that submits its scene
+    // through the Remix API uploads a surface table, a surface-material table
+    // and an instance buffer every frame, some three megabytes, so at four it
+    // crossed that boundary every frame or two and the resulting allocation
+    // showed up as multi-millisecond stalls on whichever phase asked for
+    // staging next.
+    constexpr static VkDeviceSize StagingBufferSize = 32ull << 20;
+    // NV-DXVK end
   public:
     
     DxvkContext(const Rc<DxvkDevice>& device);
