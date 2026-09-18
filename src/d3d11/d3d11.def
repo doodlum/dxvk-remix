@@ -2,11 +2,17 @@ LIBRARY dxvk_d3d11.dll
 EXPORTS  
     remixapi_InitializeLibrary
     remixapi_dxvk_RegisterD3D11Device
+    csRemixCreateGrassInstanceSet
+    csRemixCreateInstanceSet
     csRemixCreateMeshMSN
     csRemixCreateMeshNative
     csRemixApplyGraphicsPreset
     csRemixCreateRetainedInstance
+    csRemixCreateRetainedInstanceSet
+    csRemixDestroyInstanceSet
     csRemixDestroyRetainedInstance
+    csRemixDrawGrassInstanceSet
+    csRemixDrawInstanceSet
     csRemixDrawRetainedInstances
     csRemixRender
     csRemixUpdateRetainedInstance

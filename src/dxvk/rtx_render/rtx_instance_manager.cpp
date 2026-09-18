@@ -1022,6 +1022,9 @@ namespace dxvk {
 
     currentInstance.m_categoryFlags = drawCall.getCategoryFlags();
     currentInstance.surface.instancesToObject = drawCall.getTransformData().instancesToObject;
+    // Carried alongside the placements so the surface can colour each of them
+    // individually when the host asked for that.
+    currentInstance.surface.nativeInstanceSet = drawCall.getTransformData().nativeInstanceSet;
 
     // setFrameLastUpdated() must be called first as it resets instance's state on a first call in a frame
     const bool isFirstUpdateThisFrame = currentInstance.setFrameLastUpdated(m_device->getCurrentFrameId());

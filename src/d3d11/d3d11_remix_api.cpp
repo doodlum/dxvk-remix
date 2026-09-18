@@ -36,6 +36,7 @@
 #include <cmath>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #include <remix/remix_c.h>
 
@@ -307,9 +308,82 @@ namespace {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
+  // Placement snapshots the host publishes once and then names by handle. A
+  // destroyed handle cannot be submitted again, but a draw already queued keeps
+  // its snapshot alive through the shared pointer it captured.
+  std::unordered_map<uint64_t, std::shared_ptr<dxvk::NativeInstanceSet>> s_instanceSets;
+  uint64_t s_nextInstanceSet = 0;
+
+  remixapi_ErrorCode createInstanceSet(
+    const remixapi_Transform* transforms, const float* brightness, const float* phases,
+    uint32_t count, uint64_t* outHandle) {
+    if (!outHandle) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    *outHandle = 0;
+    if (!tryGetContext()) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    // An upper bound so a corrupt count cannot ask for an unbounded allocation.
+    if (!transforms || !count || count > 1000000) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    auto set = std::make_shared<dxvk::NativeInstanceSet>();
+    set->hasGrassPhases = phases != nullptr;
+    set->transforms.reserve(count);
+    set->records.reserve(count);
+
+    for (uint32_t i = 0; i < count; ++i) {
+      if (!isFinite(transforms[i])) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+      dxvk::NativeInstanceRecord record {};
+      record.transform = convert::tomat4(transforms[i]);
+      if (phases) {
+        if (!std::isfinite(phases[i])) {
+          return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+        }
+        std::memcpy(&record.padding[0], phases + i, sizeof(float));
+      }
+      if (brightness) {
+        if (!std::isfinite(brightness[i]) || brightness[i] < 0.f || brightness[i] > 1.f) {
+          return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+        }
+        const uint32_t channel = uint32_t(std::lround(brightness[i] * 255.f));
+        record.tFactor = 0xff000000u | channel * 0x010101u;
+        record.applyColor = 1;
+      }
+      set->transforms.push_back(record.transform);
+      set->records.push_back(record);
+      // Order matters: it is the expanded topology and the frame-to-frame
+      // correspondence, not just the contents.
+      set->contentHash = XXH64(&record, sizeof(record), set->contentHash ^ 0x9E3779B97F4A7C15ull);
+    }
+
+    std::lock_guard lock { s_mutex };
+    const uint64_t handle = ++s_nextInstanceSet;
+    s_instanceSets.emplace(handle, std::move(set));
+    *outHandle = handle;
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // Points a draw state at a published snapshot. The placements become the
+  // draw's instancing transforms, which is the same path a USD point instancer
+  // takes, and the snapshot rides along so the surface can read per-placement
+  // colour out of it.
+  bool attachInstanceSet(dxvk::ExternalDrawState& state, const std::shared_ptr<dxvk::NativeInstanceSet>& set) {
+    if (!set) {
+      return false;
+    }
+    state.gpuInstancingTransforms = set->transforms;
+    state.drawCall.modifyTransformData().nativeInstanceSet = set;
+    return true;
+  }
+
   std::atomic<uint64_t> s_nextRetainedInstance { 0 };
 
-  remixapi_ErrorCode setRetainedInstance(const remixapi_InstanceInfo* info, uint64_t handle) {
+  remixapi_ErrorCode setRetainedInstance(const remixapi_InstanceInfo* info, uint64_t handle, uint64_t setHandle) {
     auto* context = tryGetContext();
     if (!context) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
@@ -325,6 +399,12 @@ namespace {
     }
 
     std::lock_guard lock { s_mutex };
+    if (setHandle) {
+      const auto found = s_instanceSets.find(setHandle);
+      if (found == s_instanceSets.end() || !attachInstanceSet(*state, found->second)) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
     dxvk::D3D11RemixApiAccess::EmitCs(context,
       [cHandle = handle, cState = std::move(state)](dxvk::DxvkContext* dxvkCtx) mutable {
         static_cast<dxvk::RtxContext*>(dxvkCtx)->setRetainedExternalGeometry(cHandle, std::move(*cState));
@@ -637,7 +717,22 @@ extern "C" {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
     const uint64_t handle = ++s_nextRetainedInstance;
-    const auto result = setRetainedInstance(info, handle);
+    const auto result = setRetainedInstance(info, handle, 0);
+    if (result == REMIXAPI_ERROR_CODE_SUCCESS) {
+      *outHandle = handle;
+    }
+    return result;
+  }
+
+  // As above, but every placement in the named set is drawn from this one
+  // registration.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateRetainedInstanceSet(
+    const remixapi_InstanceInfo* info, uint64_t setHandle, uint64_t* outHandle) {
+    if (!outHandle || !setHandle) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    const uint64_t handle = ++s_nextRetainedInstance;
+    const auto result = setRetainedInstance(info, handle, setHandle);
     if (result == REMIXAPI_ERROR_CODE_SUCCESS) {
       *outHandle = handle;
     }
@@ -645,10 +740,92 @@ extern "C" {
   }
 
   // Replaces a registered draw's whole description, for a genuine change of
-  // mesh, material or category.
+  // mesh, material or category. setHandle may be zero for a single placement.
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixUpdateRetainedInstance(
+    const remixapi_InstanceInfo* info, uint64_t handle, uint64_t setHandle) {
+    return setRetainedInstance(info, handle, setHandle);
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateInstanceSet(
+    const remixapi_Transform* transforms, const float* brightness, uint32_t count, uint64_t* outHandle) {
+    return createInstanceSet(transforms, brightness, nullptr, count, outHandle);
+  }
+
+  // Grass additionally carries a per-placement phase, which the host uses to
+  // keep neighbouring blades from moving in lockstep.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateGrassInstanceSet(
+    const remixapi_Transform* transforms, const float* brightness, const float* phases,
+    uint32_t count, uint64_t* outHandle) {
+    if (!phases || !brightness) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    return createInstanceSet(transforms, brightness, phases, count, outHandle);
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixDestroyInstanceSet(uint64_t handle) {
+    std::lock_guard lock { s_mutex };
+    return s_instanceSets.erase(handle) ? REMIXAPI_ERROR_CODE_SUCCESS : REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+  }
+
+  // Draws every placement in a set once, without retaining the draw.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixDrawInstanceSet(
     const remixapi_InstanceInfo* info, uint64_t handle) {
-    return setRetainedInstance(info, handle);
+    auto* context = tryGetContext();
+    if (!context) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    // The set is the instancing description, so the caller may not also supply
+    // the public one.
+    if (!info || info->sType != REMIXAPI_STRUCT_TYPE_INSTANCE_INFO || !info->mesh
+        || pnext::find<remixapi_InstanceInfoGpuInstancingEXT>(info)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    auto state = dxvk::RemixAPIPrivateAccessor::toRtDrawState(*info);
+    if (!state) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    std::lock_guard lock { s_mutex };
+    const auto found = s_instanceSets.find(handle);
+    if (found == s_instanceSets.end() || !attachInstanceSet(*state, found->second)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    dxvk::D3D11RemixApiAccess::EmitCs(context, [cState = std::move(state)](dxvk::DxvkContext* ctx) mutable {
+      static_cast<dxvk::RtxContext*>(ctx)->commitExternalGeometryToRT(std::move(cState));
+    });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // As above for a grass set. worldWindAndTimer is the wind direction and the
+  // clock the host animates against.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixDrawGrassInstanceSet(
+    const remixapi_InstanceInfo* info, uint64_t handle, const float* worldWindAndTimer) {
+    auto* context = tryGetContext();
+    if (!context) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!info || !worldWindAndTimer || info->sType != REMIXAPI_STRUCT_TYPE_INSTANCE_INFO || !info->mesh
+        || pnext::find<remixapi_InstanceInfoGpuInstancingEXT>(info)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (!std::isfinite(worldWindAndTimer[i])) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+    auto state = dxvk::RemixAPIPrivateAccessor::toRtDrawState(*info);
+    if (!state) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    std::lock_guard lock { s_mutex };
+    const auto found = s_instanceSets.find(handle);
+    if (found == s_instanceSets.end() || !found->second->hasGrassPhases
+        || !attachInstanceSet(*state, found->second)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    dxvk::D3D11RemixApiAccess::EmitCs(context, [cState = std::move(state)](dxvk::DxvkContext* ctx) mutable {
+      static_cast<dxvk::RtxContext*>(ctx)->commitExternalGeometryToRT(std::move(cState));
+    });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
   // The common case: only the placement moved, so the registered description
