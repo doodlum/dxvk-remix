@@ -210,7 +210,7 @@ namespace dxvk {
     }
     
     if (vkImage == VK_NULL_HANDLE)
-      m_image = m_device->GetDXVKDevice()->createImage(imageInfo, memoryProperties);
+      m_image = m_device->GetDXVKDevice()->createImage(imageInfo, memoryProperties, DxvkMemoryStats::Category::AppTexture, "D3D11 Texture");
     else
       m_image = m_device->GetDXVKDevice()->createImageFromVkImage(imageInfo, vkImage);
   }
@@ -597,7 +597,7 @@ namespace dxvk {
       memType |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     
     MappedBuffer result;
-    result.buffer = m_device->GetDXVKDevice()->createBuffer(info, memType);
+    result.buffer = m_device->GetDXVKDevice()->createBuffer(info, memType, DxvkMemoryStats::Category::AppBuffer, "D3D11 Texture Mapped Buffer");
     result.slice = result.buffer->getSliceHandle();
     return result;
   }

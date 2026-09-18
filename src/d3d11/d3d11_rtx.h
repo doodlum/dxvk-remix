@@ -42,8 +42,15 @@ namespace dxvk {
     void resetDrawCallId() { m_drawCallId = 0; }
     void addDrawCallId(uint32_t count) { m_drawCallId += count; }
 
+    // Reflex frame ID for the frame currently being submitted. Incremented once
+    // per present, after every consumer for that frame has read it, so Reflex
+    // sees one consistent ID per frame.
+    uint64_t GetReflexFrameId() const { return m_reflexFrameId; }
+    void IncrementReflexFrameId() { ++m_reflexFrameId; }
+
   private:
     D3D11DeviceContext* m_context;
     uint32_t m_drawCallId = 0;
+    uint64_t m_reflexFrameId = 0;
   };
 }

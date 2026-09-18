@@ -14,8 +14,10 @@ dxbc_src = files([
   'dxbc_util.cpp',
 ])
 
+# rtx_materials.h reaches these translation units through the dxvk headers and
+# includes rtx/... from src/dxvk/shaders, so the shader include path is required.
 dxbc_lib = static_library('dxbc', dxbc_src,
-  include_directories : [ dxvk_include_path ],
+  include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths ],
   override_options    : ['cpp_std='+dxvk_cpp_std])
 
 dxbc_dep = declare_dependency(

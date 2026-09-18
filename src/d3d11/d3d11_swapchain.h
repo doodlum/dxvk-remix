@@ -124,7 +124,10 @@ namespace dxvk {
     void SubmitPresent(
             D3D11ImmediateContext*  pContext,
       const vk::PresenterSync&      Sync,
-            uint32_t                FrameId);
+            uint32_t                FrameId,
+            // NV-DXVK start: presentImage needs the acquired image index
+            uint32_t                imageIndex);
+            // NV-DXVK end
 
     void SynchronizePresent();
 

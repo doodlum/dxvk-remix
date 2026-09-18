@@ -354,8 +354,13 @@ namespace dxvk {
       }
       // NV-DXVK end
 
-      SubmitPresent(immediateContext, sync, i);
+      SubmitPresent(immediateContext, sync, i, imageIndex);
     }
+
+    // NV-DXVK start: presentImage carries the Reflex frame ID and acquired image index
+    // Prepare for the next frame, now that every consumer of this frame's ID has read it.
+    immediateContext->m_rtx.IncrementReflexFrameId();
+    // NV-DXVK end
 
     SyncFrameLatency();
     return S_OK;
@@ -365,7 +370,8 @@ namespace dxvk {
   void D3D11SwapChain::SubmitPresent(
           D3D11ImmediateContext*  pContext,
     const vk::PresenterSync&      Sync,
-          uint32_t                FrameId) {
+          uint32_t                FrameId,
+          uint32_t                imageIndex) {
     auto lock = pContext->LockContext();
 
     // Present from CS thread so that we don't
@@ -376,15 +382,23 @@ namespace dxvk {
       cFrameId     = FrameId,
       cSync        = Sync,
       cHud         = m_hud,
+      // NV-DXVK start: presentImage carries the Reflex frame ID and acquired image index
+      cReflexFrameId      = pContext->m_rtx.GetReflexFrameId(),
+      cAcquiredImageIndex = imageIndex,
+      // NV-DXVK end
       cCommandList = m_context->endRecording()
     ] (DxvkContext* ctx) {
       m_device->submitCommandList(cCommandList,
         cSync.acquire, cSync.present);
 
+      // NV-DXVK start: presentImage carries the Reflex frame ID and acquired image index
+      // One presented frame per submit: this swap chain drives no DLFG presenter, so
+      // the Reflex present markers also stay in their usual place.
       if (cHud != nullptr && !cFrameId)
-        cHud->update();
+        cHud->update(1);
 
-      m_device->presentImage(m_presenter, &m_presentStatus);
+      m_device->presentImage(cReflexFrameId, true, cAcquiredImageIndex, m_presenter, &m_presentStatus);
+      // NV-DXVK end
     });
 
     pContext->FlushCsChunk();

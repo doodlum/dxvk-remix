@@ -25,6 +25,10 @@ namespace dxvk {
     friend class D3D11DeviceContextExt;
     // Needed in order to call EmitCs for pushing markers
     friend class D3D11UserDefinedAnnotation;
+    // NV-DXVK start: API-only Remix host for D3D11
+    // Needed in order to call EmitCs for the frame-boundary commands
+    friend class D3D11Rtx;
+    // NV-DXVK end
 
     constexpr static VkDeviceSize StagingBufferSize = 4ull << 20;
   public:
