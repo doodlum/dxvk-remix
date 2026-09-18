@@ -308,6 +308,16 @@ struct name##Data {                                                             
   const bool getIgnoreAlphaChannel() const {                                                         \
     return m_ignoreAlphaChannelOverride;                                                             \
   }                                                                                                  \
+                                                                                                     \
+  /* A host-imported albedo that is gamma encoded despite a format claiming  */                      \
+  /* linear. Not hashed: it follows from the texture, which is hashed.       */                      \
+  void setNativeSrgbAlbedo(const bool value) {                                                       \
+    m_nativeSrgbAlbedo = value;                                                                      \
+  }                                                                                                  \
+                                                                                                     \
+  const bool getNativeSrgbAlbedo() const {                                                           \
+    return m_nativeSrgbAlbedo;                                                                       \
+  }                                                                                                  \
   void setNativeEffect(std::shared_ptr<const NativeEffectMaterialData> value) {                       \
     m_nativeEffect = std::move(value); updateCachedHash();                                            \
   }                                                                                                \
@@ -358,6 +368,7 @@ private:                                                                        
   XXH64_hash_t m_cachedHash { 0 };                                                                   \
   Rc<DxvkSampler> m_samplerOverride = nullptr;                                                       \
   bool m_ignoreAlphaChannelOverride = false;                                                         \
+  bool m_nativeSrgbAlbedo = false;                                                                   \
   std::shared_ptr<const NativeEffectMaterialData> m_nativeEffect;                                     \
   std::shared_ptr<const NativeLandscapeMaterialData> m_nativeLandscape;                                \
   std::shared_ptr<const NativeWaterMaterialData> m_nativeWater;                                        \

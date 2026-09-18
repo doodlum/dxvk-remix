@@ -368,7 +368,39 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 #endif
 #endif
 
-  if (surface.normalBufferIndex == BINDING_INDEX_INVALID)
+  if (surface.modelSpaceNormals && surface.normalBufferIndex != BINDING_INDEX_INVALID)
+  {
+    // Nine floats per vertex, three columns of the orientation the normal map
+    // is authored against, interpolated column by column and carried into world
+    // space. Skinning rewrites these, so they follow the pose.
+    for (uint axis = 0; axis < 3; ++axis)
+    {
+      vec3 columns[3];
+
+      for (uint i = 0; i < 3; ++i)
+      {
+        const uint element = (idx[i] * uint(surface.normalStride) + surface.normalOffset) / 4 + axis * 3;
+
+        columns[i] = vec3(
+          BUFFER_ARRAY(geometries, surface.normalBufferIndex, element + 0),
+          BUFFER_ARRAY(geometries, surface.normalBufferIndex, element + 1),
+          BUFFER_ARRAY(geometries, surface.normalBufferIndex, element + 2));
+      }
+
+      const vec3 column = mul(surface.normalObjectToWorld, interpolateHitAttribute(columns, bary));
+
+      if (axis == 0) { surfaceInteraction.modelNormalX = column; }
+      else if (axis == 1) { surfaceInteraction.modelNormalY = column; }
+      else { surfaceInteraction.modelNormalZ = column; }
+    }
+
+    // The attribute is orientation, not a normal. Feeding it through the
+    // interpolated-normal path below would treat one of its columns as a
+    // shading normal, so the geometric normal stands until the material
+    // resolves the sampled normal against the basis.
+    surfaceInteraction.geometryNormal = flippedTriangleNormal;
+  }
+  else if (surface.normalBufferIndex == BINDING_INDEX_INVALID)
   {
     surfaceInteraction.geometryNormal = flippedTriangleNormal;
   }
@@ -434,7 +466,12 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 #endif
 #endif
 
-    const vec3 geometryNormal = getBentNormal(flippedTriangleNormal, interpolatedNormal, ray.direction);
+    // Grass carries an instance-up shading direction rather than mesh normals,
+    // and bending that into the hit hemisphere turns it downward as the camera
+    // crosses a blade's back face.
+    const vec3 geometryNormal = surface.preserveVertexNormals
+      ? interpolatedNormal
+      : getBentNormal(flippedTriangleNormal, interpolatedNormal, ray.direction);
 
     if (cb.shadowTerminatorArgs.enableOffset)
     {

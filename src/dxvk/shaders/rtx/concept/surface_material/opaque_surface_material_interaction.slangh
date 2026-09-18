@@ -657,6 +657,16 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   {
     albedo = albedoOpacitySample.rgb;
 
+    // A host may import a texture the game authored in gamma space but stored
+    // in a format that claims linear, so the hardware sampled it without
+    // converting. The alpha channel stays linear in such encodings and is left
+    // alone. albedoScale then trades the darkening this conversion causes back
+    // against the game's own presentation, which never did it.
+    if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_SRGB_ALBEDO)
+    {
+      albedo = gammaToLinear(albedo) * cb.opaqueMaterialArgs.nativeAlbedoScale;
+    }
+
     // Note: Thin film thickness and opacity deriving their values from the alpha channel are mutually exclusive, set the appropriate
     // one based on the specified flags, and set the opposing variable to a default value (the "default" value must match how the material is decoded from the
     // GBuffer as well). Ideally we'd want to simply fall back on the existing opacity/thin film thickness constants instead, but we currently do not have a
@@ -772,12 +782,26 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Note: Defaults to 0 as this indicates no normal detail (which should be the case when a normal map is not present).
   float normalDetail = 0.0f;
 
-  if (normalLoaded)
+  if (normalLoaded && surface.modelSpaceNormals)
+  {
+    // A normal map imported straight from the host is not in Remix's
+    // octahedral encoding: it holds a direction in the model space the mesh
+    // was authored in, so it decodes from unsigned and resolves against the
+    // basis interpolated across the hit rather than a tangent frame. The
+    // swizzle takes the map's Y-up convention into the renderer's.
+    const vec3 modelNormal = vec3(normalSample.xzy) * 2.f - 1.f;
+
+    normal = normalize(surfaceInteraction.modelNormalX * modelNormal.x
+                     + surfaceInteraction.modelNormalY * modelNormal.y
+                     + surfaceInteraction.modelNormalZ * modelNormal.z);
+    normalDetail = 1.0f;
+  }
+  else if (normalLoaded)
   {
     vec3 tangentNormal;
 
     // Terrain baker produces decoded tangentNormal and (first) normal.
-    if (isBakedTerrain)  
+    if (isBakedTerrain)
     {
       // REMIX-2224: Normals blended during terrain baking using programmable shaders can sometimes end up being invalid so we sanitize them at this point
       tangentNormal = sanitize(normalSample.xyz, cb.isZUp ? vec3(0.f, 0.f, 1.f) : vec3(0.f, 1.f, 0.f));

@@ -1828,7 +1828,7 @@ namespace dxvk {
         subsurfaceMaterialIndex = m_surfaceMaterialExtensionCache.track(subsurfaceMaterial);
       }
 
-      const RtOpaqueSurfaceMaterial opaqueSurfaceMaterial{
+      RtOpaqueSurfaceMaterial opaqueSurfaceMaterial{
         albedoOpacityTextureIndex, normalTextureIndex,
         tangentTextureIndex, heightTextureIndex, roughnessTextureIndex,
         metallicTextureIndex, emissiveColorTextureIndex,
@@ -1842,6 +1842,10 @@ namespace dxvk {
         samplerFeedbackStamp,
         secondaryTextureIndex
       };
+
+      // Not a constructor argument: this describes how the imported texture must
+      // be read, and the texture is already part of the material identity.
+      opaqueSurfaceMaterial.setNativeSrgbAlbedo(opaqueMaterialData.getNativeSrgbAlbedo());
 
       surfaceMaterial.emplace(opaqueSurfaceMaterial);
     } else if (renderMaterialDataType == MaterialDataType::Translucent) {

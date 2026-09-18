@@ -658,6 +658,10 @@ struct RtOpaqueSurfaceMaterial {
     // NOTE: We keep the most commonly used elements in the material close together near the beginning
     //       This hopefully reduces loads for cases like opacity detection.
 
+    if (m_nativeSrgbAlbedo) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_SRGB_ALBEDO;
+    }
+
     if (m_isRaytracedRenderTarget) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET;
     }
@@ -826,6 +830,12 @@ struct RtOpaqueSurfaceMaterial {
     return m_isRaytracedRenderTarget;
   }
 
+  // A host-imported albedo that is gamma encoded despite its format. Does not
+  // enter the hash: it is a property of how the texture must be read, and the
+  // texture itself is already part of the identity.
+  void setNativeSrgbAlbedo(bool value) { m_nativeSrgbAlbedo = value; }
+  bool getNativeSrgbAlbedo() const { return m_nativeSrgbAlbedo; }
+
   template<typename Fn>
   void forEachTextureIndex(Fn&& fn) const {
     fn(m_albedoOpacityTextureIndex);
@@ -840,8 +850,11 @@ struct RtOpaqueSurfaceMaterial {
 
 private:
   void updateCachedHash() {
+    // m_nativeSrgbAlbedo is deliberately absent from HashStruct below: it is
+    // derived from the albedo texture's format, and that texture's index is
+    // already hashed, so two materials that differ in it cannot collide.
     static_assert(
-      sizeof(*this) == 120,
+      sizeof(*this) == 128,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -949,6 +962,10 @@ private:
   uint32_t m_subsurfaceMaterialIndex;
 
   bool m_isRaytracedRenderTarget;
+
+  // Set by a host that imported an albedo texture the game authored in gamma
+  // space but stored in a format claiming linear, so the shader must convert.
+  bool m_nativeSrgbAlbedo = false;
   bool m_isHairCard;
 
   uint16_t m_samplerFeedbackStamp;

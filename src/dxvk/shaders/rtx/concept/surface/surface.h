@@ -305,6 +305,34 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 1) : packedFlagUnset(data0b.z, 1 << 1); }
   }
 
+  // Bits 2-4 are spare. 5-7 describe geometry submitted through the Remix API;
+  // RtSurface::writeGPUData writes them.
+
+  // The normal attribute is a nine-float basis, not a normal: the columns of
+  // the bind-pose to current-pose orientation, which the sampled normal is
+  // authored against.
+  property bool modelSpaceNormals
+  {
+    get { return packedFlagGet(data0b.z, 1 << 5); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 5) : packedFlagUnset(data0b.z, 1 << 5); }
+  }
+
+  // Keep the supplied shading direction on both faces rather than bending it
+  // into the hit hemisphere.
+  property bool preserveVertexNormals
+  {
+    get { return packedFlagGet(data0b.z, 1 << 6); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 6) : packedFlagUnset(data0b.z, 1 << 6); }
+  }
+
+  // The vertex colour attribute carries per-vertex terrain blend weights
+  // alongside the colour.
+  property bool nativeLandscape
+  {
+    get { return packedFlagGet(data0b.z, 1 << 7); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 7) : packedFlagUnset(data0b.z, 1 << 7); }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }
@@ -533,6 +561,13 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec3 rawBitangent = 0.f;
   vec4 vertexColor = 0.0f;
   float triangleArea = 0.f;
+
+  // World-space columns of the orientation a model-space normal map is
+  // authored against, interpolated across the hit. Identity unless the
+  // surface says modelSpaceNormals.
+  vec3 modelNormalX = vec3(1.f, 0.f, 0.f);
+  vec3 modelNormalY = vec3(0.f, 1.f, 0.f);
+  vec3 modelNormalZ = vec3(0.f, 0.f, 1.f);
 };
 
 struct GBufferMemoryMinimalSurfaceInteraction

@@ -50,6 +50,7 @@
 #include "../dxvk/rtx_render/rtx_remix_api_convert.h"
 #include "../dxvk/rtx_render/rtx_options.h"
 #include "../dxvk/rtx_render/rtx_postFx.h"
+#include "../dxvk/rtx_render/rtx_light_manager.h"
 
 #include "../util/util_math.h"
 
@@ -771,6 +772,78 @@ extern "C" {
     return setRetainedInstance(info, handle, setHandle);
   }
 
+  // Points the dome light at a texture the host already holds on this device,
+  // and instances it for this frame.
+  //
+  // Remix's dome light is exactly the sky an API host wants: sampled on every
+  // ray that escapes, so it is both the visible background and the scene's
+  // image-based lighting, and the runtime's whole sampling path is already
+  // written for it. The one thing it cannot do is take a texture that is not a
+  // .dds file on disk, which rules out a sky the host redraws as the weather
+  // and the time of day change. This takes the image directly.
+  //
+  // The projection is the one the dome light already expects: equirectangular,
+  // Z-up in light space, with transform mapping light space to world.
+  //
+  // The runtime clears the active dome light at the end of every frame, so this
+  // both registers and instances -- one call per frame is the whole contract.
+  // It does not light the scene by itself: nothing samples a dome light
+  // directly, so the sun and moons remain separate analytic lights.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixSetSkyDome(
+    ID3D11ShaderResourceView* latLongTexture, const remixapi_Transform* lightToWorld, const float* radiance) {
+    auto* context = tryGetContext();
+    if (!context) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!lightToWorld || !radiance || !isFinite(*lightToWorld)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    for (uint32_t i = 0; i < 3; ++i) {
+      if (!std::isfinite(radiance[i]) || radiance[i] < 0.f) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+
+    // A null texture retires the sky rather than being an error: the host may
+    // have nothing to show during a load.
+    dxvk::Rc<dxvk::DxvkImageView> view;
+    if (latLongTexture) {
+      view = importedView(latLongTexture);
+      if (view == nullptr) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+
+    // One handle for the host's sky, reused every frame: the dome light is
+    // singular, and a fresh handle each frame would leak entries into the
+    // runtime's map.
+    static const auto skyHandle = reinterpret_cast<remixapi_LightHandle>(0x43535253'4b590001ull);
+
+    std::lock_guard lock { s_mutex };
+    dxvk::D3D11RemixApiAccess::EmitCs(context,
+      [cView = std::move(view),
+       cTransform = convert::tomat4(*lightToWorld),
+       cRadiance = dxvk::Vector3(radiance[0], radiance[1], radiance[2])](dxvk::DxvkContext* ctx) {
+        if (cView == nullptr) {
+          return;
+        }
+        dxvk::DomeLight domeLight;
+        domeLight.radiance = cRadiance;
+        domeLight.worldToLight = inverse(cTransform);
+        domeLight.texture = dxvk::TextureRef { cView };
+
+        // Keeps the image resident for the frame that samples it.
+        uint32_t unused;
+        auto& sceneManager = ctx->getCommonObjects()->getSceneManager();
+        sceneManager.trackTexture(domeLight.texture, unused, true, true);
+
+        auto& lightManager = sceneManager.getLightManager();
+        lightManager.addExternalDomeLight(skyHandle, domeLight);
+        lightManager.addExternalLightInstance(skyHandle);
+      });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
   // Builds a material from textures the host already holds on this device.
   // textureAddressMode bit 1 repeats U, bit 0 repeats V; anything else clamps.
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateMaterialD3D11V3(
@@ -793,6 +866,14 @@ extern "C" {
     std::lock_guard lock { s_mutex };
     auto material = convert::toRtMaterialWithoutTexturePreload(*info);
     material.getOpaqueMaterialData().setAlbedoOpacityTexture(dxvk::TextureRef { albedoView });
+
+    // A game may author its diffuse textures in gamma space and still store them
+    // in a format that claims linear, in which case the hardware samples them
+    // without converting and the shader has to. An sRGB format needs nothing:
+    // the hardware has already done it.
+    const auto* albedoFormat = dxvk::imageFormatInfo(albedoView->info().format);
+    const bool hardwareConverts = albedoFormat && albedoFormat->flags.test(dxvk::DxvkFormatFlag::ColorSpaceSrgb);
+    material.getOpaqueMaterialData().setNativeSrgbAlbedo(!hardwareConverts);
     if (normal) {
       auto normalView = importedView(normal);
       if (normalView == nullptr) {

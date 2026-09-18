@@ -16,6 +16,7 @@ EXPORTS
     csRemixDrawInstanceSet
     csRemixDrawRetainedInstances
     csRemixRender
+    csRemixSetSkyDome
     csRemixUpdateRetainedInstance
     csRemixUpdateRetainedInstanceTransform
     CreateDXGIFactory

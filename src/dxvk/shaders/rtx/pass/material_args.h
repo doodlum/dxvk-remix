@@ -34,6 +34,8 @@ struct OpaqueMaterialArgs {
   float metallicScale = 1.f;
   float metallicBias = 0.f;
   float normalIntensity = 1.f;
+  // Applied after converting a host-imported gamma-encoded albedo to linear.
+  float nativeAlbedoScale = 1.f;
   float layeredWaterNormalMotionX = 0.f;
   float layeredWaterNormalMotionY = 0.f;
   float layeredWaterNormalMotionScale = 1.f;
@@ -43,7 +45,6 @@ struct OpaqueMaterialArgs {
   // Note: This thickness value is normalized on 0-1, predivided by the thinFilmMaxThickness on the CPU.
   float thinFilmNormalizedThicknessOverride = 0.0;
   uint pad0 = 0;
-  uint pad1 = 0;
 };
 
 struct TranslucentMaterialArgs {
@@ -83,6 +84,11 @@ struct OpaqueMaterialOptions {
   RTX_OPTION("rtx.opaqueMaterial", float, metallicScale, 1.0f, "A scale factor to apply to all metallic values in the opaque material. Should only be used for debugging or development.");
   RTX_OPTION("rtx.opaqueMaterial", float, metallicBias, 0.0f, "A bias factor to add to all metallic values in the opaque material. Should only be used for debugging or development.");
   RTX_OPTION("rtx.opaqueMaterial", float, normalIntensity, 1.0f, "An arbitrary strength scale factor to apply when decoding normals in the opaque material. Should only be used for debugging or development.");
+  RTX_OPTION("rtx.opaqueMaterial", float, nativeAlbedoScale, 1.0f,
+             "Scale applied to a host-imported albedo after it has been converted from gamma to linear.\n"
+             "Converting a texture the game authored in gamma space darkens it relative to what the game itself displayed, "
+             "since the game sampled it without converting. A host whose textures are all in that state sets this to compensate; "
+             "1.0 leaves the converted value alone. Has no effect on materials without the native sRGB albedo flag.");
   RTX_OPTION("rtx.opaqueMaterial", Vector2, layeredWaterNormalMotion, Vector2(-0.25f, -0.3f),
              "A vector describing the motion in the U and V axes across a texture to apply for layered water.\n"
              "Only takes effect when layered water normals are enabled (and an object is properly classified as animated water).");
@@ -116,6 +122,7 @@ public:
     args.metallicScale = metallicScale();
     args.metallicBias = metallicBias();
     args.normalIntensity = normalIntensity();
+    args.nativeAlbedoScale = nativeAlbedoScale();
     args.layeredWaterNormalMotionX = layeredWaterNormalMotion().x;
     args.layeredWaterNormalMotionY = layeredWaterNormalMotion().y;
     args.layeredWaterNormalMotionScale = layeredWaterNormalMotionScale();
