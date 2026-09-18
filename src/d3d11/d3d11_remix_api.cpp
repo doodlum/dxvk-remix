@@ -49,6 +49,7 @@
 #include "../dxvk/rtx_render/rtx_scene_manager.h"
 #include "../dxvk/rtx_render/rtx_remix_api_convert.h"
 #include "../dxvk/rtx_render/rtx_options.h"
+#include "../dxvk/rtx_render/rtx_postFx.h"
 
 #include "../util/util_math.h"
 
@@ -981,6 +982,15 @@ extern "C" {
     dxvk::D3D11RemixApiAccess::EmitCs(context, [cPreset = preset](dxvk::DxvkContext* dxvkCtx) {
       dxvk::RtxOptions::graphicsPreset.setImmediately(static_cast<dxvk::GraphicsPreset>(cPreset));
       dxvk::RtxOptions::updateGraphicsPresets(dxvkCtx->getDevice().ptr());
+
+      // Medium and Low turn Remix's post-processing off, which for a host that
+      // composites the result itself means the image it receives is the raw
+      // lit buffer -- no tone mapping, so it reads as a gbuffer view. A host
+      // chooses a preset to buy back path-tracing time, not to give up the
+      // presentation, so both of the things that decide how the frame looks
+      // rather than how long it takes are put back afterwards.
+      dxvk::DxvkPostFx::enable.setImmediately(true);
+      dxvk::RtxOptions::enableUnorderedResolveInIndirectRays.setImmediately(true);
     });
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
