@@ -4,6 +4,7 @@ EXPORTS
     remixapi_dxvk_RegisterD3D11Device
     csRemixCreateGrassInstanceSet
     csRemixCreateInstanceSet
+    csRemixCreateMaterialD3D11V3
     csRemixCreateMeshMSN
     csRemixCreateMeshNative
     csRemixApplyGraphicsPreset

@@ -43,6 +43,7 @@
 #include "d3d11_device.h"
 #include "d3d11_context_imm.h"
 #include "d3d11_texture.h"
+#include "d3d11_view_srv.h"
 
 #include "../dxvk/rtx_render/rtx_context.h"
 #include "../dxvk/rtx_render/rtx_scene_manager.h"
@@ -306,6 +307,29 @@ namespace {
 
     *outHandle = handle;
     return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // A texture the host already has on this device becomes a material without a
+  // readback or a file: the view names a Vulkan image, and TextureRef holds it
+  // for the material's lifetime.
+  //
+  // An API-only host does not run the legacy texture-hashing path, so an
+  // imported image can arrive with no hash. MaterialData hashes its textures by
+  // image hash, and leaving it zero would alias unrelated native textures in
+  // the surface-material cache, so one is derived from the image handle.
+  dxvk::Rc<dxvk::DxvkImageView> importedView(ID3D11ShaderResourceView* view) {
+    if (!view) {
+      return {};
+    }
+    auto image = static_cast<dxvk::D3D11ShaderResourceView*>(view)->GetImageView();
+    if (image == nullptr) {
+      return {};
+    }
+    if (image->image()->getHash() == 0) {
+      const auto nativeHandle = image->image()->handle();
+      image->image()->setHash(XXH64(&nativeHandle, sizeof(nativeHandle), 0x435352454d4958ull));
+    }
+    return image;
   }
 
   // Placement snapshots the host publishes once and then names by handle. A
@@ -744,6 +768,57 @@ extern "C" {
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixUpdateRetainedInstance(
     const remixapi_InstanceInfo* info, uint64_t handle, uint64_t setHandle) {
     return setRetainedInstance(info, handle, setHandle);
+  }
+
+  // Builds a material from textures the host already holds on this device.
+  // textureAddressMode bit 1 repeats U, bit 0 repeats V; anything else clamps.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateMaterialD3D11V3(
+    const remixapi_MaterialInfo* info, ID3D11ShaderResourceView* albedo, ID3D11ShaderResourceView* normal,
+    uint32_t textureAddressMode, remixapi_MaterialHandle* outHandle) {
+    auto* context = tryGetContext();
+    if (!context) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!info || !outHandle || !albedo || !info->hash
+        || info->sType != REMIXAPI_STRUCT_TYPE_MATERIAL_INFO
+        || !pnext::find<remixapi_MaterialInfoOpaqueEXT>(info)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    auto albedoView = importedView(albedo);
+    if (albedoView == nullptr) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    std::lock_guard lock { s_mutex };
+    auto material = convert::toRtMaterialWithoutTexturePreload(*info);
+    material.getOpaqueMaterialData().setAlbedoOpacityTexture(dxvk::TextureRef { albedoView });
+    if (normal) {
+      auto normalView = importedView(normal);
+      if (normalView == nullptr) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+      material.getOpaqueMaterialData().setNormalTexture(dxvk::TextureRef { normalView });
+    }
+
+    dxvk::DxvkSamplerCreateInfo sampler {};
+    sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sampler.mipmapLodMax = VK_LOD_CLAMP_NONE;
+    sampler.useAnisotropy = VK_TRUE;
+    sampler.maxAnisotropy = 8.0f;
+    sampler.addressModeU = (textureAddressMode & 2) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeV = (textureAddressMode & 1) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    material.getOpaqueMaterialData().setSamplerOverride(s_device->GetDXVKDevice()->createSampler(sampler));
+
+    auto handle = reinterpret_cast<remixapi_MaterialHandle>(info->hash);
+    dxvk::D3D11RemixApiAccess::EmitCs(context,
+      [handle, data = std::move(material)](dxvk::DxvkContext* ctx) mutable {
+        ctx->getCommonObjects()->getSceneManager().getAssetReplacer()
+          ->makeMaterialWithTexturePreload(*ctx, handle, std::move(data));
+      });
+    *outHandle = handle;
+    return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateInstanceSet(
