@@ -179,6 +179,18 @@ namespace dxvk {
                                             const Matrix4& viewToProjection) {
     DecomposeProjectionParams decomposeProjectionParams = getOrDecomposeProjection(viewToProjection);
 
+    // The planes drive the volumetric froxel grid, among other things, and a
+    // host's projection is taken on trust, so report what was read out of it.
+    if ((m_device->getCurrentFrameId() % 600u) == 11u) {
+      Logger::info(str::format("[RTX.camera] external type=", static_cast<int>(type),
+        " fov=", decomposeProjectionParams.fov,
+        " aspect=", decomposeProjectionParams.aspectRatio,
+        " near=", decomposeProjectionParams.nearPlane,
+        " far=", decomposeProjectionParams.farPlane,
+        " isLHS=", decomposeProjectionParams.isLHS,
+        " isReverseZ=", decomposeProjectionParams.isReverseZ));
+    }
+
     getCamera(type).update(
       m_device->getCurrentFrameId(),
       worldToView,

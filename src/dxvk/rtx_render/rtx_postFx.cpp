@@ -299,6 +299,14 @@ namespace dxvk {
     postFxArgs.motionBlurDlfgDeduction = ctx->isDLFGEnabled() ?
       1.0f / static_cast<float>(ctx->dlfgInterpolatedFrameCount() + 1) : 1.0f;
 
+    // Lets the blur recognise background pixels, which carry neither a surface
+    // nor a velocity, the same way the composite does.
+    NrdArgs primaryDirectNrdArgs;
+    NrdArgs primaryIndirectNrdArgs;
+    NrdArgs secondaryNrdArgs;
+    ctx->getDenoiseArgs(primaryDirectNrdArgs, primaryIndirectNrdArgs, secondaryNrdArgs);
+    postFxArgs.primaryDirectMissLinearViewZ = primaryDirectNrdArgs.missLinearViewZ;
+
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
     dispatchMotionBlurInternal(

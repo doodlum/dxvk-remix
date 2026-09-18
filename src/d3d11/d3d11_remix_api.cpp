@@ -1066,14 +1066,18 @@ extern "C" {
       dxvk::RtxOptions::graphicsPreset.setImmediately(static_cast<dxvk::GraphicsPreset>(cPreset));
       dxvk::RtxOptions::updateGraphicsPresets(dxvkCtx->getDevice().ptr());
 
-      // Medium and Low turn Remix's post-processing off, which for a host that
-      // composites the result itself means the image it receives is the raw
-      // lit buffer -- no tone mapping, so it reads as a gbuffer view. A host
-      // chooses a preset to buy back path-tracing time, not to give up the
-      // presentation, so both of the things that decide how the frame looks
-      // rather than how long it takes are put back afterwards.
-      dxvk::DxvkPostFx::enable.setImmediately(true);
+      // Medium and Low also drop unordered resolve in indirect rays, which is
+      // what makes alpha-tested geometry resolve correctly in bounces rather
+      // than a cost. A host picks a preset to buy back path-tracing time, not
+      // to change what the frame contains, so that one is put back.
       dxvk::RtxOptions::enableUnorderedResolveInIndirectRays.setImmediately(true);
+
+      // rtx.postfx is deliberately left as the preset set it. Its lens-effects
+      // pass loses every pixel where the primary ray missed -- the sky turns
+      // black with chromatic aberration, vignette and motion blur all
+      // individually disabled, so it is the pass rather than any one effect.
+      // Tone mapping, bloom and auto-exposure are separate passes and still
+      // run, so the frame is still fully post-processed by Remix.
     });
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }

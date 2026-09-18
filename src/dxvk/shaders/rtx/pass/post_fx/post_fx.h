@@ -75,6 +75,10 @@ struct PostFxArgs {
   bool   enableMotionBlurEmissive;
   float  jitterStrength;
   float  motionBlurDlfgDeduction;
+
+  // The linear view depth written where a primary ray hit nothing. Those
+  // pixels carry no surface and no velocity, so they must not be blurred.
+  float  primaryDirectMissLinearViewZ;
 };
 
 struct PostFxMotionBlurPrefilterArgs {

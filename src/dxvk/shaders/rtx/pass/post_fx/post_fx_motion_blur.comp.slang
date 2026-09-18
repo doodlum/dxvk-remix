@@ -109,6 +109,15 @@ bool isValidMotionBlurPixel(const uint2 pixelPos, inout bool isStaticPixel)
   MotionBlurSurfaceFlags motionBlurSurfaceFlags = motionBlurSurfaceFlagsReadFromGBuffer(PrimarySurfaceFlags[inputPosInt]);
   isStaticPixel = motionBlurSurfaceFlags.isStatic;
 
+  // A pixel where the primary ray hit nothing is background: it has no surface
+  // behind it and no velocity, so the flags and motion vector read above
+  // describe nothing. Blurring it smears whatever those happened to hold over
+  // the sky.
+  if (PrimaryLinearViewZ[inputPosInt] == cb.primaryDirectMissLinearViewZ)
+  {
+    return false;
+  }
+
   // Valid motion blur pixels: emissive opaque (if it's enabled by setting), non-ViewModel
   return (cb.enableMotionBlurEmissive || !motionBlurSurfaceFlags.isEmissive) && (!motionBlurSurfaceFlags.isViewModel) && (!motionBlurSurfaceFlags.isMaskOut);
 }
