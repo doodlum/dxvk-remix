@@ -1030,7 +1030,9 @@ extern "C"
       interf.pick_RequestObjectPicking = remixapi_pick_RequestObjectPicking;
       interf.pick_HighlightObjects = remixapi_pick_HighlightObjects;
     }
-    static_assert(sizeof(interf) == 176, "Add/remove function registration");
+    // dxvk_RegisterD3D11Device is left null: that slot belongs to the D3D11
+    // frontend, which fills the interface itself.
+    static_assert(sizeof(interf) == 184, "Add/remove function registration");
 
     *out_result = interf;
     return REMIXAPI_ERROR_CODE_SUCCESS;

@@ -737,6 +737,11 @@ extern "C" {
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_RegisterD3D9Device)(
     IDirect3DDevice9Ex* d3d9Device);
 
+  // NV-DXVK start: a frontend hosting the API from D3D11
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_RegisterD3D11Device)(
+    struct ID3D11Device* d3d11Device);
+  // NV-DXVK end
+
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_GetExternalSwapchain)(
     uint64_t*           out_vkImage,
     uint64_t*           out_vkSemaphoreRenderingDone,
@@ -799,6 +804,9 @@ extern "C" {
     PFN_remixapi_Present            Present;
 
     PFN_remixapi_SetCameraMediumMaterial SetCameraMediumMaterial;
+    // NV-DXVK start: a frontend hosting the API from D3D11
+    PFN_remixapi_dxvk_RegisterD3D11Device   dxvk_RegisterD3D11Device;
+    // NV-DXVK end
   } remixapi_Interface;
 
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(
