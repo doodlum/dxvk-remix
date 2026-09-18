@@ -15,7 +15,13 @@ namespace dxvk {
           D3D11Device*    pParent,
     const Rc<DxvkDevice>& Device)
   : D3D11DeviceContext(pParent, Device, DxvkCsChunkFlag::SingleUse),
-    m_csThread(Device, Device->createContext()),
+    // NV-DXVK start: the command stream runs the ray-tracing context
+    // Everything Remix does is recorded here, and its passes recover the
+    // context with dynamic_cast. A plain DxvkContext leaves the scene
+    // submitted but uncomposited, and kills the command-stream thread with a
+    // bad cast the moment compositing is reached. D3D9 does the same.
+    m_csThread(Device, Device->createRtxContext()),
+    // NV-DXVK end
     m_videoContext(this, Device) {
     EmitCs([
       cDevice                 = m_device,

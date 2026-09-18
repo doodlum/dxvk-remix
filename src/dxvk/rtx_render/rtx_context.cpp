@@ -149,6 +149,42 @@ namespace dxvk {
     // required upfront, but there's no good place to do that for this RTX extension (the D3D9 stuff does it before device
     // creation), so instead we just check for what is needed.
     // Note: When adding new extensions update DxvkAdapter::createDevice as it is what brings these features over.
+    // NV-DXVK start: name the requirement that failed
+    // "Raytracing doesn't appear to be supported" is otherwise unactionable,
+    // and a frontend that asks for a device without the features Remix needs
+    // gets exactly that message on hardware that plainly supports ray tracing.
+    {
+      const auto& f = m_device->features();
+      const auto& p = m_device->properties();
+      const std::pair<const char*, bool> requirements[] = {
+        { "shaderInt16", !!f.core.features.shaderInt16 },
+        { "storageBuffer16BitAccess", !!f.vulkan11Features.storageBuffer16BitAccess },
+        { "uniformAndStorageBuffer16BitAccess", !!f.vulkan11Features.uniformAndStorageBuffer16BitAccess },
+        { "bufferDeviceAddress", !!f.vulkan12Features.bufferDeviceAddress },
+        { "descriptorIndexing", !!f.vulkan12Features.descriptorIndexing },
+        { "runtimeDescriptorArray", !!f.vulkan12Features.runtimeDescriptorArray },
+        { "descriptorBindingPartiallyBound", !!f.vulkan12Features.descriptorBindingPartiallyBound },
+        { "shaderStorageBufferArrayNonUniformIndexing", !!f.vulkan12Features.shaderStorageBufferArrayNonUniformIndexing },
+        { "shaderSampledImageArrayNonUniformIndexing", !!f.vulkan12Features.shaderSampledImageArrayNonUniformIndexing },
+        { "descriptorBindingVariableDescriptorCount", !!f.vulkan12Features.descriptorBindingVariableDescriptorCount },
+        { "shaderInt8", !!f.vulkan12Features.shaderInt8 },
+        { "shaderFloat16", !!f.vulkan12Features.shaderFloat16 },
+        { "uniformAndStorageBuffer8BitAccess", !!f.vulkan12Features.uniformAndStorageBuffer8BitAccess },
+        { "accelerationStructure", !!f.khrAccelerationStructureFeatures.accelerationStructure },
+        { "rayQuery", !!f.khrRayQueryFeatures.rayQuery },
+        { "rayTracingPipeline", !!f.khrDeviceRayTracingPipelineFeatures.rayTracingPipeline },
+        { "VK_KHR_shader_float16_int8", !!m_device->extensions().khrShaderInt8Float16Types },
+        { "subgroupSize", p.coreSubgroup.subgroupSize >= 1 },
+        { "subgroup compute stage", (p.coreSubgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 },
+        { "subgroup arithmetic", (p.coreSubgroup.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0 },
+      };
+      for (const auto& requirement : requirements) {
+        if (!requirement.second) {
+          ONCE(Logger::warn(str::format("[RTX-Compatibility-Info] Missing requirement: ", requirement.first)));
+        }
+      }
+    }
+    // NV-DXVK end
     m_rayTracingSupported = (m_device->features().core.features.shaderInt16 &&
                              m_device->features().vulkan11Features.storageBuffer16BitAccess &&
                              m_device->features().vulkan11Features.uniformAndStorageBuffer16BitAccess &&

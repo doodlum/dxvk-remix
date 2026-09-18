@@ -1,8 +1,19 @@
 d3d11_res = wrc_generator.process('version.rc')
 
+# The whole DXGI implementation is built into this DLL, not just the parts the
+# swap chain needs. RTX keeps global state -- the option singleton above all --
+# and a static library linked into two DLLs gives each its own copy of it: the
+# DXGI DLL would create the options while the device created them again, null,
+# in this one. dxvk_dxgi.dll forwards its exports here instead.
 dxgi_common_src = [
+  '../dxgi/dxgi_adapter.cpp',
+  '../dxgi/dxgi_enums.cpp',
+  '../dxgi/dxgi_factory.cpp',
   '../dxgi/dxgi_format.cpp',
+  '../dxgi/dxgi_main.cpp',
   '../dxgi/dxgi_monitor.cpp',
+  '../dxgi/dxgi_options.cpp',
+  '../dxgi/dxgi_output.cpp',
   '../dxgi/dxgi_swapchain.cpp',
 ]
 
@@ -70,7 +81,7 @@ d3d11_shaders = files([
 d3d11_dll = shared_library('dxvk_d3d11'+dll_ext, dxgi_common_src + d3d11_src + d3d10_src,
     glsl_generator.process(d3d11_shaders), d3d11_res,
   name_prefix         : '',
-  dependencies        : [ dxgi_dep, dxbc_dep, dxvk_dep ],
+  dependencies        : [ dxbc_dep, dxvk_dep ],
   include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths, remix_api_include_path ],
   install             : true,
   vs_module_defs      : 'd3d11'+def_spec_ext,

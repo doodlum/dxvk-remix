@@ -1,23 +1,11 @@
 dxgi_res = wrc_generator.process('version.rc')
 
-dxgi_src = [
-  'dxgi_adapter.cpp',
-  'dxgi_enums.cpp',
-  'dxgi_factory.cpp',
-  'dxgi_format.cpp',
-  'dxgi_main.cpp',
-  'dxgi_monitor.cpp',
-  'dxgi_options.cpp',
-  'dxgi_output.cpp',
-  'dxgi_swapchain.cpp',
-]
-
-dxgi_dll = shared_library('dxvk_dxgi'+dll_ext, dxgi_src, dxgi_res,
+# A forwarder only. The implementation is compiled into dxvk_d3d11.dll, because
+# the RTX runtime keeps global state that must exist once in the process; see
+# the note on dxgi_common_src in ../d3d11/meson.build.
+dxgi_dll = shared_library('dxvk_dxgi'+dll_ext, ['dxgi_forward.cpp'], dxgi_res,
   name_prefix         : '',
-  dependencies        : [ dxvk_dep ],
-  include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths ],
   install             : true,
-  vs_module_defs      : 'dxgi'+def_spec_ext,
   override_options    : ['cpp_std='+dxvk_cpp_std])
 
 dxgi_dep = declare_dependency(

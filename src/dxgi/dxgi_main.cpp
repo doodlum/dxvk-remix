@@ -3,7 +3,9 @@
 
 namespace dxvk {
   
-  Logger Logger::s_instance("dxgi.log");
+  // NV-DXVK start: DXGI is compiled into the D3D11 DLL
+  // Logger::s_instance is defined there, in d3d11_main.cpp; one per DLL.
+  // NV-DXVK end
   
   HRESULT createDxgiFactory(UINT Flags, REFIID riid, void **ppFactory) {
     try {
