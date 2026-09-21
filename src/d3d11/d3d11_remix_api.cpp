@@ -50,7 +50,11 @@
 #include "../dxvk/rtx_render/rtx_remix_api_convert.h"
 #include "../dxvk/rtx_render/rtx_options.h"
 #include "../dxvk/rtx_render/rtx_postFx.h"
+#include "../dxvk/imgui/dxvk_imgui.h"
 #include "../dxvk/rtx_render/rtx_light_manager.h"
+// NV-DXVK start: Authored basis and landscape weight transport.
+#include "../dxvk/rtx_render/rtx_native_basis_vertex.h"
+// NV-DXVK end
 
 #include "../util/util_math.h"
 
@@ -58,14 +62,22 @@ namespace dxvk {
   // D3D11DeviceContext::EmitCs and RestoreState are protected; this accessor is
   // a friend of it.
   struct D3D11RemixApiAccess {
+    // NV-DXVK start: Serialize API submissions with host readback workers.
+    static void EnableMultithreadProtection(D3D11ImmediateContext* ctx) {
+      ctx->m_multithread.SetMultithreadProtected(TRUE);
+    }
+
     template<typename Cmd>
     static void EmitCs(D3D11ImmediateContext* ctx, Cmd&& command) {
+      auto lock = ctx->LockContext();
       ctx->EmitCs(std::forward<Cmd>(command));
     }
 
     static void RestoreState(D3D11ImmediateContext* ctx) {
+      auto lock = ctx->LockContext();
       ctx->RestoreState();
     }
+    // NV-DXVK end
   };
 }
 
@@ -73,6 +85,9 @@ namespace {
   dxvk::D3D11Device*           s_device  { nullptr };
   dxvk::D3D11ImmediateContext* s_context { nullptr };
   dxvk::mutex                  s_mutex {};
+  // NV-DXVK start: Compatible imported morph snapshots retain mesh identity.
+  std::unordered_map<remixapi_MeshHandle, std::vector<uint64_t>> s_meshLayouts;
+  // NV-DXVK end
 
   dxvk::D3D11ImmediateContext* tryGetContext() {
     return s_context;
@@ -90,17 +105,6 @@ namespace {
   size_t sizeInBytes(const T* values, size_t count) {
     return sizeof(T) * count;
   }
-
-  // The vertex a host submits when its normal maps are authored in model space.
-  // The nine floats replacing the normal are the columns of the bind-pose to
-  // current-pose orientation, which skinning rewrites; for rigid geometry they
-  // stay the identity and the sampled normal is already in model space.
-  struct ModelNormalVertex {
-    float position[3];
-    float basis[9];
-    float texcoord[2];
-    uint32_t color;
-  };
 
   dxvk::Rc<dxvk::DxvkBuffer> allocMeshBuffer(size_t sizeInBytes) {
     if (sizeInBytes == 0) {
@@ -141,8 +145,9 @@ namespace {
 
   remixapi_ErrorCode createMeshInternal(
     const remixapi_MeshInfo* info, remixapi_MeshHandle* outHandle,
-    bool modelSpaceNormals, bool preserveVertexNormals = false,
-    bool nativeGrass = false, bool nativeLandscape = false) {
+    bool modelSpaceNormals, bool useFaceNormals = false,
+    bool nativeGrass = false, bool nativeLandscape = false, const float* tangentFrame = nullptr,
+    bool updateExisting = false) {
     auto* context = tryGetContext();
     if (!context) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
@@ -155,6 +160,40 @@ namespace {
     if (!handle) {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
+
+    // NV-DXVK start: Reject incompatible updates before queueing any GPU work.
+    std::lock_guard lock { s_mutex };
+    if (!info->surfaces_values || !info->surfaces_count || info->surfaces_count > 1024) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    std::vector<uint64_t> layouts;
+    for (size_t i = 0; i < info->surfaces_count; ++i) {
+      const auto& surface = info->surfaces_values[i];
+      const auto& skin = surface.skinning_value;
+      if (!surface.vertices_values || !surface.vertices_count || !surface.indices_values || !surface.indices_count ||
+          (surface.skinning_hasvalue && (!skin.blendWeights_values || !skin.blendIndices_values ||
+            !skin.bonesPerVertex || skin.bonesPerVertex > 256 ||
+            size_t(skin.blendWeights_count) != size_t(surface.vertices_count) * skin.bonesPerVertex ||
+            size_t(skin.blendIndices_count) != size_t(surface.vertices_count) * skin.bonesPerVertex))) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+      const uint64_t descriptor[] = { surface.vertices_count, surface.indices_count,
+        uint64_t(surface.skinning_hasvalue ? skin.bonesPerVertex : 0),
+        uint64_t(modelSpaceNormals), uint64_t(useFaceNormals), uint64_t(nativeGrass),
+        uint64_t(nativeLandscape), uint64_t(tangentFrame != nullptr), reinterpret_cast<uintptr_t>(surface.material) };
+      uint64_t signature = XXH64(descriptor, sizeof(descriptor), 0);
+      signature = XXH64(surface.indices_values, sizeInBytes(surface.indices_values, surface.indices_count), signature);
+      if (surface.skinning_hasvalue) {
+        signature = XXH64(skin.blendWeights_values, sizeInBytes(skin.blendWeights_values, skin.blendWeights_count), signature);
+        signature = XXH64(skin.blendIndices_values, sizeInBytes(skin.blendIndices_values, skin.blendIndices_count), signature);
+      }
+      layouts.push_back(signature);
+    }
+    const auto previousLayout = s_meshLayouts.find(handle);
+    if (updateExisting && (previousLayout == s_meshLayouts.end() || previousLayout->second != layouts)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    // NV-DXVK end
 
     std::vector<dxvk::RasterGeometry> allocatedSurfaces;
     std::vector<MeshUpload> uploads;
@@ -171,21 +210,20 @@ namespace {
     for (size_t i = 0; i < info->surfaces_count; i++) {
       const remixapi_MeshInfoSurfaceTriangles& src = info->surfaces_values[i];
 
-      std::vector<ModelNormalVertex> modelVertices;
-      if (modelSpaceNormals) {
-        modelVertices.resize(src.vertices_count);
+      // NV-DXVK start: Preserve authored basis and optional landscape weights.
+      const uint32_t basisStride = dxvk::NativeBasisVertex::stride(nativeLandscape);
+      std::vector<uint8_t> modelVertices;
+      if (modelSpaceNormals || tangentFrame) {
+        modelVertices.resize(size_t(src.vertices_count) * basisStride);
         for (size_t v = 0; v < src.vertices_count; ++v) {
-          auto& vertex = modelVertices[v];
-          std::memcpy(vertex.position, src.vertices_values[v].position, sizeof(vertex.position));
-          std::memset(vertex.basis, 0, sizeof(vertex.basis));
-          vertex.basis[0] = vertex.basis[4] = vertex.basis[8] = 1.f;
-          std::memcpy(vertex.texcoord, src.vertices_values[v].texcoord, sizeof(vertex.texcoord));
-          vertex.color = src.vertices_values[v].color;
+          dxvk::writeNativeBasisVertex(modelVertices.data() + v * basisStride, src.vertices_values[v],
+            tangentFrame ? tangentFrame + v * 6 : nullptr, nativeLandscape);
         }
       }
-      const size_t vertexDataSize = modelSpaceNormals
-        ? modelVertices.size() * sizeof(ModelNormalVertex)
+      const size_t vertexDataSize = (modelSpaceNormals || tangentFrame)
+        ? modelVertices.size()
         : sizeInBytes(src.vertices_values, src.vertices_count);
+      // NV-DXVK end
       const size_t indexDataSize = sizeInBytes(src.indices_values, src.indices_count);
 
       dxvk::Rc<dxvk::DxvkBuffer> vertexBuffer = allocMeshBuffer(vertexDataSize);
@@ -194,7 +232,7 @@ namespace {
 
       auto vertexSlice = dxvk::DxvkBufferSlice { vertexBuffer };
       queueUpload(vertexBuffer, 0,
-        modelSpaceNormals ? static_cast<const void*>(modelVertices.data())
+        (modelSpaceNormals || tangentFrame) ? static_cast<const void*>(modelVertices.data())
                           : static_cast<const void*>(src.vertices_values), vertexDataSize);
 
       auto indexSlice = dxvk::DxvkBufferSlice {};
@@ -253,11 +291,13 @@ namespace {
         }
       }
 
-      if (modelSpaceNormals) {
-        dst.positionBuffer = dxvk::RasterBuffer { vertexSlice, offsetof(ModelNormalVertex, position), sizeof(ModelNormalVertex), VK_FORMAT_R32G32B32_SFLOAT };
-        dst.normalBuffer   = dxvk::RasterBuffer { vertexSlice, offsetof(ModelNormalVertex, basis),    sizeof(ModelNormalVertex), VK_FORMAT_R32G32B32_SFLOAT };
-        dst.texcoordBuffer = dxvk::RasterBuffer { vertexSlice, offsetof(ModelNormalVertex, texcoord), sizeof(ModelNormalVertex), VK_FORMAT_R32G32_SFLOAT };
-        dst.color0Buffer   = dxvk::RasterBuffer { vertexSlice, offsetof(ModelNormalVertex, color),    sizeof(ModelNormalVertex), VK_FORMAT_B8G8R8A8_UNORM };
+      if (modelSpaceNormals || tangentFrame) {
+        // NV-DXVK start: Color-relative landscape weights remain in this stride.
+        dst.positionBuffer = dxvk::RasterBuffer { vertexSlice, offsetof(dxvk::NativeBasisVertex, position), basisStride, VK_FORMAT_R32G32B32_SFLOAT };
+        dst.normalBuffer   = dxvk::RasterBuffer { vertexSlice, offsetof(dxvk::NativeBasisVertex, basis),    basisStride, VK_FORMAT_R32G32B32_SFLOAT };
+        dst.texcoordBuffer = dxvk::RasterBuffer { vertexSlice, offsetof(dxvk::NativeBasisVertex, texcoord), basisStride, VK_FORMAT_R32G32_SFLOAT };
+        dst.color0Buffer   = dxvk::RasterBuffer { vertexSlice, offsetof(dxvk::NativeBasisVertex, color),    basisStride, VK_FORMAT_B8G8R8A8_UNORM };
+        // NV-DXVK end
       } else {
         dst.positionBuffer = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, position), sizeof(remixapi_HardcodedVertex), VK_FORMAT_R32G32B32_SFLOAT };
         dst.normalBuffer   = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, normal),   sizeof(remixapi_HardcodedVertex), VK_FORMAT_R32G32B32_SFLOAT };
@@ -266,7 +306,8 @@ namespace {
       }
 
       dst.modelSpaceNormals = modelSpaceNormals;
-      dst.preserveVertexNormals = preserveVertexNormals;
+      dst.nativeTangentFrame = tangentFrame != nullptr;
+      dst.useFaceNormals = useFaceNormals;
       dst.nativeGrass = nativeGrass;
       dst.nativeLandscape = nativeLandscape;
       if (nativeGrass) {
@@ -295,16 +336,38 @@ namespace {
       allocatedSurfaces.push_back(std::move(dst));
     }
 
-    std::lock_guard lock { s_mutex };
+    if (updateExisting || previousLayout == s_meshLayouts.end()) {
+      s_meshLayouts[handle] = std::move(layouts);
+    }
     dxvk::D3D11RemixApiAccess::EmitCs(context,
-      [cHandle = handle, cSurfaces = std::move(allocatedSurfaces), cUploads = std::move(uploads)](dxvk::DxvkContext* ctx) mutable {
+      [cHandle = handle, cSurfaces = std::move(allocatedSurfaces), cUploads = std::move(uploads), updateExisting](dxvk::DxvkContext* ctx) mutable {
         // Staged here so the transfers are ordered before any structure build
         // or shader read of the same buffers.
         for (const auto& upload : cUploads) {
           ctx->writeToBuffer(upload.buffer, upload.offset, upload.bytes.size(), upload.bytes.data());
         }
         auto& assets = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
-        assets->registerExternalMesh(cHandle, std::move(cSurfaces));
+        // NV-DXVK start: Immutable snapshots retain old GPU resources in flight.
+        if (updateExisting) {
+          const auto previous = assets->accessExternalMesh(cHandle);
+          if (previous->size() != cSurfaces.size()) {
+            dxvk::Logger::err("[CSRemix.morph] Missing mesh snapshot during update");
+            return;
+          }
+          for (size_t i = 0; i < cSurfaces.size(); ++i) {
+            auto& next = cSurfaces[i];
+            const auto& old = (*previous)[i];
+            next.hashes[dxvk::HashComponents::Indices] = old.hashes[dxvk::HashComponents::Indices];
+            next.hashes[dxvk::HashComponents::GeometryDescriptor] = old.hashes[dxvk::HashComponents::GeometryDescriptor];
+            next.hashes[dxvk::HashComponents::VertexLayout] = old.hashes[dxvk::HashComponents::VertexLayout];
+            next.hashes.precombine();
+          }
+        }
+        assets->registerExternalMesh(cHandle, std::move(cSurfaces), updateExisting);
+        if (updateExisting) {
+          ctx->getCommonObjects()->getSceneManager().invalidateExternalMesh(cHandle);
+        }
+        // NV-DXVK end
       });
 
     *outHandle = handle;
@@ -338,11 +401,15 @@ namespace {
   // destroyed handle cannot be submitted again, but a draw already queued keeps
   // its snapshot alive through the shared pointer it captured.
   std::unordered_map<uint64_t, std::shared_ptr<dxvk::NativeInstanceSet>> s_instanceSets;
+  // Weak: the material owns its water, so a destroyed material takes it with
+  // it and a later update on a stale handle simply fails.
+  std::unordered_map<remixapi_MaterialHandle, std::weak_ptr<dxvk::NativeWaterMaterialData>> s_nativeWater;
+  std::unordered_map<remixapi_MaterialHandle, std::weak_ptr<dxvk::NativeEffectMaterialData>> s_nativeEffects;
   uint64_t s_nextInstanceSet = 0;
 
   remixapi_ErrorCode createInstanceSet(
     const remixapi_Transform* transforms, const float* brightness, const float* phases,
-    uint32_t count, uint64_t* outHandle) {
+    uint32_t count, uint64_t* outHandle, const float* grassNormalRows = nullptr) {
     if (!outHandle) {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
@@ -359,6 +426,9 @@ namespace {
     set->hasGrassPhases = phases != nullptr;
     set->transforms.reserve(count);
     set->records.reserve(count);
+    if (phases) {
+      set->grassRecords.reserve(count);
+    }
 
     for (uint32_t i = 0; i < count; ++i) {
       if (!isFinite(transforms[i])) {
@@ -385,6 +455,23 @@ namespace {
       // Order matters: it is the expanded topology and the frame-to-frame
       // correspondence, not just the contents.
       set->contentHash = XXH64(&record, sizeof(record), set->contentHash ^ 0x9E3779B97F4A7C15ull);
+      if (phases) {
+        dxvk::NativeGrassRecord grassRecord {};
+        grassRecord.placement = record;
+        grassRecord.placement.padding[1] = grassNormalRows ? 1u : 0u;
+        for (uint32_t row = 0; row < 3; ++row) {
+          for (uint32_t col = 0; col < 3; ++col) {
+            const float value = grassNormalRows ? grassNormalRows[size_t(i) * 9 + row * 3 + col] : transforms[i].matrix[row][col];
+            if (!std::isfinite(value)) {
+              return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+            }
+            grassRecord.normalRows[row][col] = value;
+          }
+          grassRecord.normalRows[row][3] = 0.f;
+        }
+        set->grassRecords.push_back(grassRecord);
+        set->contentHash = XXH64(&grassRecord, sizeof(grassRecord), set->contentHash);
+      }
     }
 
     std::lock_guard lock { s_mutex };
@@ -453,6 +540,7 @@ namespace {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
     std::lock_guard lock { s_mutex };
+    s_meshLayouts.erase(handle);
     dxvk::D3D11RemixApiAccess::EmitCs(context, [cHandle = handle](dxvk::DxvkContext* ctx) {
       ctx->getCommonObjects()->getSceneManager().destroyExternalMesh(dxvk::Rc<dxvk::DxvkContext>(ctx), cHandle);
     });
@@ -640,6 +728,10 @@ namespace {
 
 extern "C" {
 
+  REMIXAPI uint32_t REMIXAPI_CALL csRemixGuiInput(uint32_t type, uint32_t code, float value) {
+    return s_device && s_device->GetDXVKDevice()->getCommon()->getImgui().queueHostInput(type, code, value);
+  }
+
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_RegisterD3D11Device(ID3D11Device* d3d11Device);
 
 
@@ -706,6 +798,7 @@ extern "C" {
       REMIXAPI_VERSION_MAJOR, REMIXAPI_VERSION_MINOR, REMIXAPI_VERSION_PATCH);
     s_device = device;
     s_context = static_cast<dxvk::D3D11ImmediateContext*>(context);
+    dxvk::D3D11RemixApiAccess::EnableMultithreadProtection(s_context);
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
@@ -716,8 +809,63 @@ extern "C" {
     return createMeshInternal(info, outHandle, true);
   }
 
-  // Bit 0 model-space basis, bit 1 keep the supplied shading direction on both
-  // faces, bit 2 expanded grass, bit 3 five-layer terrain. Grass is expanded
+  // NV-DXVK start: Dynamic facial snapshots preserve compatible topology/history.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixUpdateMeshV1(
+    const remixapi_MeshInfo* info, const float* tangentFrame, uint32_t flags) {
+    if ((flags & ~3u) || ((flags & 1u) && tangentFrame) || !info ||
+        !info->surfaces_values || info->surfaces_count != 1) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    const auto& surface = info->surfaces_values[0];
+    if (!surface.vertices_values || !surface.vertices_count || surface.vertices_count > 1000000) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    for (size_t i = 0; i < surface.vertices_count; ++i) {
+      for (uint32_t axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(surface.vertices_values[i].position[axis])) {
+          return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+        }
+      }
+      if (tangentFrame) {
+        for (uint32_t axis = 0; axis < 6; ++axis) {
+          if (!std::isfinite(tangentFrame[i * 6 + axis])) {
+            return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+          }
+        }
+      }
+    }
+    remixapi_MeshHandle handle = nullptr;
+    return createMeshInternal(info, &handle, (flags & 1u) != 0, (flags & 2u) != 0,
+      false, false, tangentFrame, true);
+  }
+  // NV-DXVK end
+
+  // NV-DXVK start: Single-surface authored T/B, optional six-layer terrain (bit3).
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateMeshTBNV2(
+    const remixapi_MeshInfo* info, const float* tangentFrame, uint32_t vertexCount,
+    uint32_t flags, remixapi_MeshHandle* outHandle) {
+    if ((flags & ~8u) || !info || !info->surfaces_values || info->surfaces_count != 1 || !tangentFrame
+        || !vertexCount || vertexCount != info->surfaces_values[0].vertices_count
+        || !info->surfaces_values[0].vertices_values
+        || ((flags & 8u) && info->surfaces_values[0].skinning_hasvalue)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    for (size_t component = 0; component < size_t(vertexCount) * 6; ++component) {
+      if (!std::isfinite(tangentFrame[component])) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+    return createMeshInternal(info, outHandle, false, false, false, (flags & 8u) != 0, tangentFrame);
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateMeshTBN(
+    const remixapi_MeshInfo* info, const float* tangentFrame, uint32_t vertexCount, remixapi_MeshHandle* outHandle) {
+    return csRemixCreateMeshTBNV2(info, tangentFrame, vertexCount, 0, outHandle);
+  }
+  // NV-DXVK end
+
+  // Bit 0 model-space basis, bit 1 flat face normals,
+  // bit 2 expanded grass, bit 3 native terrain. Grass is expanded
   // from one unskinned prototype, and terrain carries its own blend weights, so
   // neither combines with the others.
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateMeshNative(
@@ -726,7 +874,7 @@ extern "C" {
     const bool landscape = (flags & 8u) != 0;
     if ((flags & ~15u)
         || (landscape && (flags & 7u))
-        || (grass && ((flags & 3u) != 2u || !info || !info->surfaces_values
+        || (grass && ((flags & 1u) || !info || !info->surfaces_values
                       || info->surfaces_count != 1 || info->surfaces_values[0].skinning_hasvalue))) {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
@@ -846,11 +994,12 @@ extern "C" {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
-  // Builds a material from textures the host already holds on this device.
+  // NV-DXVK start: Import resident thin-surface transmission textures.
   // textureAddressMode bit 1 repeats U, bit 0 repeats V; anything else clamps.
-  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateMaterialD3D11V3(
+  static remixapi_ErrorCode createMaterialD3D11(
     const remixapi_MaterialInfo* info, ID3D11ShaderResourceView* albedo, ID3D11ShaderResourceView* normal,
-    uint32_t textureAddressMode, remixapi_MaterialHandle* outHandle) {
+    ID3D11ShaderResourceView* transmission, uint32_t textureAddressMode, remixapi_MaterialHandle* outHandle,
+    std::shared_ptr<const dxvk::NativeFoliageMaterialData> foliage = {}, bool diffusionTransmission = false) {
     auto* context = tryGetContext();
     if (!context) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
@@ -865,9 +1014,28 @@ extern "C" {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
 
+    dxvk::Rc<dxvk::DxvkImageView> transmissionView;
+    if (transmission) {
+      const auto* subsurface = pnext::find<remixapi_MaterialInfoOpaqueSubsurfaceEXT>(info);
+      if (!subsurface || bool(subsurface->subsurfaceDiffusionProfile) != diffusionTransmission ||
+          (!diffusionTransmission && (!std::isfinite(subsurface->subsurfaceMeasurementDistance) || subsurface->subsurfaceMeasurementDistance <= 0.f))) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+      transmissionView = importedView(transmission);
+      if (transmissionView == nullptr) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+
     std::lock_guard lock { s_mutex };
     auto material = convert::toRtMaterialWithoutTexturePreload(*info);
     material.getOpaqueMaterialData().setAlbedoOpacityTexture(dxvk::TextureRef { albedoView });
+    if (foliage) {
+      material.getOpaqueMaterialData().setNativeFoliage(std::move(foliage));
+    }
+    if (transmissionView != nullptr) {
+      material.getOpaqueMaterialData().setSubsurfaceTransmittanceTexture(dxvk::TextureRef { transmissionView });
+    }
 
     // A game may author its diffuse textures in gamma space and still store them
     // in a format that claims linear, in which case the hardware samples them
@@ -882,6 +1050,7 @@ extern "C" {
         return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
       }
       material.getOpaqueMaterialData().setNormalTexture(dxvk::TextureRef { normalView });
+      material.getOpaqueMaterialData().setNativeRgbNormal(true);
     }
 
     dxvk::DxvkSamplerCreateInfo sampler {};
@@ -894,6 +1063,427 @@ extern "C" {
     sampler.addressModeV = (textureAddressMode & 1) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     material.getOpaqueMaterialData().setSamplerOverride(s_device->GetDXVKDevice()->createSampler(sampler));
+
+    auto handle = reinterpret_cast<remixapi_MaterialHandle>(info->hash);
+    dxvk::D3D11RemixApiAccess::EmitCs(context,
+      [handle, data = std::move(material)](dxvk::DxvkContext* ctx) mutable {
+        ctx->getCommonObjects()->getSceneManager().getAssetReplacer()
+          ->makeMaterialWithTexturePreload(*ctx, handle, std::move(data));
+      });
+    *outHandle = handle;
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateMaterialD3D11V3(
+    const remixapi_MaterialInfo* info, ID3D11ShaderResourceView* albedo, ID3D11ShaderResourceView* normal,
+    uint32_t textureAddressMode, remixapi_MaterialHandle* outHandle) {
+    return createMaterialD3D11(info, albedo, normal, nullptr, textureAddressMode, outHandle);
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateMaterialD3D11V4(
+    const remixapi_MaterialInfo* info, ID3D11ShaderResourceView* albedo, ID3D11ShaderResourceView* normal,
+    ID3D11ShaderResourceView* transmission, uint32_t textureAddressMode, remixapi_MaterialHandle* outHandle) {
+    return createMaterialD3D11(info, albedo, normal, transmission, textureAddressMode, outHandle);
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateSkinMaterialD3D11V1(
+    const remixapi_MaterialInfo* info, ID3D11ShaderResourceView* albedo, ID3D11ShaderResourceView* normal,
+    ID3D11ShaderResourceView* transmission, uint32_t textureAddressMode, remixapi_MaterialHandle* outHandle) {
+    if (!info || !transmission || textureAddressMode > 3) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    const auto* subsurface = pnext::find<remixapi_MaterialInfoOpaqueSubsurfaceEXT>(info);
+    if (!subsurface || !subsurface->subsurfaceDiffusionProfile) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    const float values[] = { subsurface->subsurfaceRadius.x, subsurface->subsurfaceRadius.y,
+      subsurface->subsurfaceRadius.z, subsurface->subsurfaceRadiusScale, subsurface->subsurfaceMaxSampleRadius };
+    for (const float value : values) {
+      if (!std::isfinite(value) || value <= 0.f || value > 65504.f) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+    // Diffusion sampling performs its own gamma decode. The host supplies an
+    // authored-space bake; an sRGB view here would decode the colour twice.
+    auto view = importedView(transmission);
+    if (view == nullptr) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    const auto* format = dxvk::imageFormatInfo(view->info().format);
+    if (!format || format->flags.test(dxvk::DxvkFormatFlag::ColorSpaceSrgb)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    return createMaterialD3D11(info, albedo, normal, transmission, textureAddressMode, outHandle, {}, true);
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateFoliageMaterialD3D11V1(
+    const remixapi_MaterialInfo* info, ID3D11ShaderResourceView* albedo, ID3D11ShaderResourceView* normal,
+    ID3D11ShaderResourceView* softLight, ID3D11ShaderResourceView* backLight,
+    uint32_t textureAddressMode, uint32_t flags, const float* parameters, remixapi_MaterialHandle* outHandle) {
+    if (!parameters || !(flags & 7u) || (flags & ~127u) ||
+        ((flags & 64u) && !(flags & 1u)) || textureAddressMode > 3 || !info) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    const auto* subsurface = pnext::find<remixapi_MaterialInfoOpaqueSubsurfaceEXT>(info);
+    if (!subsurface || subsurface->subsurfaceDiffusionProfile ||
+        !std::isfinite(subsurface->subsurfaceMeasurementDistance) || subsurface->subsurfaceMeasurementDistance <= 0.f) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    auto foliage = std::make_shared<dxvk::NativeFoliageMaterialData>();
+    foliage->flags = flags;
+    for (uint32_t i = 0; i < foliage->parameters.size(); ++i) {
+      if (!std::isfinite(parameters[i]) || parameters[i] < 0.f || parameters[i] > 65504.f) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+      foliage->parameters[i] = parameters[i];
+    }
+    if (parameters[3] <= 0.f) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    if (softLight) {
+      auto view = importedView(softLight);
+      if (view == nullptr) { return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS; }
+      foliage->softLight = dxvk::TextureRef { view };
+    }
+    if (backLight) {
+      auto view = importedView(backLight);
+      if (view == nullptr) { return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS; }
+      foliage->backLight = dxvk::TextureRef { view };
+    }
+    return createMaterialD3D11(info, albedo, normal, nullptr, textureAddressMode, outHandle, std::move(foliage));
+  }
+  // NV-DXVK end
+
+  // A host's animated effect: a scrolling source texture whose colour and alpha
+  // are resolved through a palette. The 20 parameters are the UV offset and
+  // scale, the base RGBA, falloff[4], scale, property alpha, soft depth, the
+  // lighting influence, the external RGB and the flags.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateEffectMaterialD3D11V1(
+    const remixapi_MaterialInfo* info, ID3D11ShaderResourceView* source,
+    ID3D11ShaderResourceView* palette, uint32_t addressMode, const float* parameters,
+    remixapi_MaterialHandle* outHandle) {
+    auto* context = tryGetContext();
+    if (!context) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!info || !outHandle || !parameters || !info->hash || addressMode > 3
+        || info->sType != REMIXAPI_STRUCT_TYPE_MATERIAL_INFO
+        || !pnext::find<remixapi_MaterialInfoOpaqueEXT>(info)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    for (uint32_t i = 0; i < 20; ++i) {
+      // The half-packed entries have to stay inside the format's range.
+      const bool packedHalf = (i >= 4 && i < 8) || i == 12 || (i >= 15 && i < 19);
+      if (!std::isfinite(parameters[i]) || (packedHalf && std::abs(parameters[i]) > 65504.f)) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+    // The flags word is packed into the low bits alongside the sRGB mask.
+    if (parameters[19] < 0 || parameters[19] > 8188 || uint32_t(parameters[19]) != parameters[19] || (uint32_t(parameters[19]) & 3u)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    auto effect = std::make_shared<dxvk::NativeEffectMaterialData>();
+    effect->identity = info->hash;
+    std::copy_n(parameters, 20, effect->parameters.begin());
+
+    dxvk::Rc<dxvk::DxvkImageView> sourceView;
+    if (source) {
+      sourceView = importedView(source);
+      if (sourceView == nullptr) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+      const auto* format = dxvk::imageFormatInfo(sourceView->info().format);
+      if (format && format->flags.test(dxvk::DxvkFormatFlag::ColorSpaceSrgb)) {
+        effect->srgbMask |= 1;
+      }
+    }
+    if (palette) {
+      auto paletteView = importedView(palette);
+      if (paletteView == nullptr) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+      const auto* format = dxvk::imageFormatInfo(paletteView->info().format);
+      if (format && format->flags.test(dxvk::DxvkFormatFlag::ColorSpaceSrgb)) {
+        effect->srgbMask |= 2;
+      }
+      effect->palette = dxvk::TextureRef { paletteView };
+    }
+
+    std::lock_guard lock { s_mutex };
+    auto material = convert::toRtMaterialWithoutTexturePreload(*info);
+    auto& opaque = material.getOpaqueMaterialData();
+    if (sourceView != nullptr) {
+      opaque.setAlbedoOpacityTexture(dxvk::TextureRef { sourceView });
+    }
+    opaque.setNativeEffect(effect);
+
+    dxvk::DxvkSamplerCreateInfo sampler {};
+    sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sampler.mipmapLodMax = VK_LOD_CLAMP_NONE;
+    sampler.addressModeU = (addressMode & 2) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeV = (addressMode & 1) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    opaque.setSamplerOverride(s_device->GetDXVKDevice()->createSampler(sampler));
+    // A palette is a lookup table, so it is point sampled and clamped.
+    sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    effect->paletteSampler = s_device->GetDXVKDevice()->createSampler(sampler);
+
+    auto handle = reinterpret_cast<remixapi_MaterialHandle>(info->hash);
+    s_nativeEffects[handle] = effect;
+    dxvk::D3D11RemixApiAccess::EmitCs(context,
+      [handle, data = std::move(material)](dxvk::DxvkContext* ctx) mutable {
+        ctx->getCommonObjects()->getSceneManager().getAssetReplacer()
+          ->makeMaterialWithTexturePreload(*ctx, handle, std::move(data));
+      });
+    *outHandle = handle;
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // Effects animate every frame through these parameters alone, so the identity
+  // stays stable and scrolling never creates a new material.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixUpdateEffectMaterialV1(
+    remixapi_MaterialHandle handle, const float* parameters) {
+    auto* context = tryGetContext();
+    if (!context) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!parameters) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    std::array<float, 20> values;
+    std::copy_n(parameters, 20, values.begin());
+    for (uint32_t i = 0; i < 20; ++i) {
+      const bool packedHalf = (i >= 4 && i < 8) || i == 12 || (i >= 15 && i < 19);
+      if (!std::isfinite(values[i]) || (packedHalf && std::abs(values[i]) > 65504.f)) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+    if (values[19] < 0 || values[19] > 8188 || uint32_t(values[19]) != values[19] || (uint32_t(values[19]) & 3u)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    std::lock_guard lock { s_mutex };
+    const auto found = s_nativeEffects.find(handle);
+    if (found == s_nativeEffects.end()) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    auto effect = found->second.lock();
+    if (!effect) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    // NV-DXVK start: Upload in-place native effect updates independently of geometry.
+    dxvk::D3D11RemixApiAccess::EmitCs(context,
+      [effect = std::move(effect), values](dxvk::DxvkContext* ctx) {
+        effect->parameters = values;
+        ctx->getCommonObjects()->getSceneManager().notifyExternalMaterialChanged();
+      });
+    // NV-DXVK end
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // A host's water. Six incoming views: the first is the material's own normal
+  // map, then two more scrolling layers, the flow atlas and the flow normal.
+  // The 26 parameters are scale[3], amplitude[3], scroll[6], the projected UV
+  // basis[6], cell[4], the signed dimension, the clock and the wading flag.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateWaterMaterialD3D11V3(
+    const remixapi_MaterialInfo* info, ID3D11ShaderResourceView* const* normals,
+    const float* parameters, remixapi_MaterialHandle* outHandle) {
+    auto* context = tryGetContext();
+    if (!context) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!info || !normals || !parameters || !outHandle || !info->hash
+        || info->sType != REMIXAPI_STRUCT_TYPE_MATERIAL_INFO
+        || !pnext::find<remixapi_MaterialInfoTranslucentEXT>(info)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    for (uint32_t i = 0; i < 26; ++i) {
+      // The three scales divide the UVs, so they may not be zero or negative.
+      if (!std::isfinite(parameters[i]) || (i < 3 && (parameters[i] < 1.0f || parameters[i] > 65504.0f))) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+    if (parameters[25] != 0.0f && parameters[25] != 1.0f) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    auto water = std::make_shared<dxvk::NativeWaterMaterialData>();
+    water->identity = info->hash;
+    std::copy_n(parameters, 26, water->parameters.begin());
+
+    dxvk::Rc<dxvk::DxvkImageView> baseNormal;
+    for (uint32_t i = 0; i < 5; ++i) {
+      if (!normals[i]) {
+        continue;
+      }
+      auto view = importedView(normals[i]);
+      if (view == nullptr) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+      if (i == 0) {
+        baseNormal = std::move(view);
+      } else {
+        water->extraNormals[i - 1] = dxvk::TextureRef { view };
+      }
+    }
+
+    std::lock_guard lock { s_mutex };
+    auto material = convert::toRtMaterialWithoutTexturePreload(*info);
+    auto& translucent = material.getTranslucentMaterialData();
+    if (baseNormal != nullptr) {
+      translucent.setNormalTexture(dxvk::TextureRef { baseNormal });
+    }
+    translucent.setNativeWater(water);
+
+    dxvk::DxvkSamplerCreateInfo sampler {};
+    sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sampler.mipmapLodMax = VK_LOD_CLAMP_NONE;
+    sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    translucent.setSamplerOverride(s_device->GetDXVKDevice()->createSampler(sampler));
+    // The flow atlas is a lookup, not a texture: point sampled and clamped.
+    sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    water->flowSampler = s_device->GetDXVKDevice()->createSampler(sampler);
+
+    auto handle = reinterpret_cast<remixapi_MaterialHandle>(info->hash);
+    s_nativeWater[handle] = water;
+    dxvk::D3D11RemixApiAccess::EmitCs(context,
+      [handle, data = std::move(material)](dxvk::DxvkContext* ctx) mutable {
+        ctx->getCommonObjects()->getSceneManager().getAssetReplacer()
+          ->makeMaterialWithTexturePreload(*ctx, handle, std::move(data));
+      });
+    *outHandle = handle;
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // Water moves every frame, but only through these parameters: the textures
+  // and the material itself stay put, so this never rebuilds the material.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixUpdateWaterMaterialV3(
+    remixapi_MaterialHandle handle, const float* parameters) {
+    auto* context = tryGetContext();
+    if (!context) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!parameters) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    std::array<float, 26> values;
+    std::copy_n(parameters, 26, values.begin());
+    for (uint32_t i = 0; i < 26; ++i) {
+      if (!std::isfinite(values[i]) || (i < 3 && (values[i] < 1.0f || values[i] > 65504.0f))) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+    if (values[25] != 0.0f && values[25] != 1.0f) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    std::lock_guard lock { s_mutex };
+    const auto found = s_nativeWater.find(handle);
+    if (found == s_nativeWater.end()) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    auto water = found->second.lock();
+    if (!water) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    // Written on the command stream so a frame never reads half an update.
+    // NV-DXVK start: Upload in-place native water updates independently of geometry.
+    dxvk::D3D11RemixApiAccess::EmitCs(context,
+      [water = std::move(water), values](dxvk::DxvkContext* ctx) {
+        water->parameters = values;
+        ctx->getCommonObjects()->getSceneManager().notifyExternalMaterialChanged();
+      });
+    // NV-DXVK end
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // Terrain, where each surface blends six albedo and six normal layers by
+  // per-vertex weights the mesh carries. albedos[0]/normals[0] are the base
+  // pair and also become the material's ordinary textures, so anything that
+  // does not read the blend still sees something sensible.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateLandscapeMaterialD3D11(
+    const remixapi_MaterialInfo* info, ID3D11ShaderResourceView* const* albedos,
+    ID3D11ShaderResourceView* const* normals, uint32_t textureAddressMode,
+    remixapi_MaterialHandle* outHandle) {
+    auto* context = tryGetContext();
+    if (!context) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!info || !outHandle || !albedos || !normals || !albedos[0] || !info->hash
+        || info->sType != REMIXAPI_STRUCT_TYPE_MATERIAL_INFO
+        || !pnext::find<remixapi_MaterialInfoOpaqueEXT>(info)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    // Six layers arrive. The first is the material's ordinary albedo and
+    // normal, which everything that does not read the blend already uses; only
+    // the other five are carried as extra layers, so the shader indexes them
+    // as layer-1 and never stores the base twice.
+    auto land = std::make_shared<dxvk::NativeLandscapeMaterialData>();
+    dxvk::Rc<dxvk::DxvkImageView> baseAlbedo, baseNormal;
+
+    for (uint32_t layer = 0; layer < 6; ++layer) {
+      if (albedos[layer]) {
+        auto view = importedView(albedos[layer]);
+        if (view == nullptr) {
+          return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+        }
+        // A layer the hardware already decoded is recorded, so the shader
+        // re-encodes only the ones it must before blending.
+        const auto* format = dxvk::imageFormatInfo(view->info().format);
+        if (format && format->flags.test(dxvk::DxvkFormatFlag::ColorSpaceSrgb)) {
+          land->srgbMask |= uint16_t(1u << layer);
+        }
+        if (layer == 0) {
+          baseAlbedo = std::move(view);
+        } else {
+          land->albedo[layer - 1] = dxvk::TextureRef { view };
+        }
+      }
+      if (normals[layer]) {
+        auto view = importedView(normals[layer]);
+        if (view == nullptr) {
+          return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+        }
+        if (layer == 0) {
+          baseNormal = std::move(view);
+        } else {
+          land->normal[layer - 1] = dxvk::TextureRef { view };
+        }
+      }
+    }
+
+    std::lock_guard lock { s_mutex };
+    auto material = convert::toRtMaterialWithoutTexturePreload(*info);
+    auto& opaque = material.getOpaqueMaterialData();
+    opaque.setAlbedoOpacityTexture(dxvk::TextureRef { baseAlbedo });
+    if (baseNormal != nullptr) {
+      opaque.setNormalTexture(dxvk::TextureRef { baseNormal });
+    }
+    opaque.setNativeLandscape(std::move(land));
+    // The blend re-encodes each layer to gamma so that one decode covers all of
+    // them. Without this the terrain stays gamma encoded and reads far too
+    // bright and washed out -- grass and dirt come out looking like snow.
+    opaque.setNativeSrgbAlbedo(true);
+    // Terrain's alpha is a blend weight rather than coverage, so reading it as
+    // opacity would punch holes in the ground.
+    opaque.setIgnoreAlphaChannel(true);
+
+    dxvk::DxvkSamplerCreateInfo sampler {};
+    sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
+    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sampler.mipmapLodMax = VK_LOD_CLAMP_NONE;
+    sampler.useAnisotropy = VK_TRUE;
+    sampler.maxAnisotropy = 8.0f;
+    sampler.addressModeU = (textureAddressMode & 2) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeV = (textureAddressMode & 1) ? VK_SAMPLER_ADDRESS_MODE_REPEAT : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    opaque.setSamplerOverride(s_device->GetDXVKDevice()->createSampler(sampler));
 
     auto handle = reinterpret_cast<remixapi_MaterialHandle>(info->hash);
     dxvk::D3D11RemixApiAccess::EmitCs(context,
@@ -919,6 +1509,20 @@ extern "C" {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
     return createInstanceSet(transforms, brightness, phases, count, outHandle);
+  }
+
+  // V2 supplies the native shader's row-major 3x3 normal transform independently
+  // of the position transform. The source normals remain unnormalized until hit interpolation.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCreateGrassInstanceSetV2(
+    const remixapi_Transform* transforms, const float* brightness, const float* phases,
+    const float* normalRows, uint32_t count, uint64_t* outHandle) {
+    if (!phases || !brightness || !normalRows) {
+      if (outHandle) {
+        *outHandle = 0;
+      }
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    return createInstanceSet(transforms, brightness, phases, count, outHandle, normalRows);
   }
 
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixDestroyInstanceSet(uint64_t handle) {
@@ -981,6 +1585,12 @@ extern "C" {
         || !attachInstanceSet(*state, found->second)) {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
+    // The expansion needs the set mutably, to cache the deformed vertex and
+    // index buffers on it, and it needs this frame's wind to move the blades.
+    state->nativeInstanceSet = found->second;
+    state->nativeGrassWind = dxvk::Vector4 {
+      worldWindAndTimer[0], worldWindAndTimer[1], worldWindAndTimer[2], worldWindAndTimer[3] };
+    state->hasNativeGrassWind = true;
     dxvk::D3D11RemixApiAccess::EmitCs(context, [cState = std::move(state)](dxvk::DxvkContext* ctx) mutable {
       static_cast<dxvk::RtxContext*>(ctx)->commitExternalGeometryToRT(std::move(cState));
     });
@@ -1082,6 +1692,20 @@ extern "C" {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
+  // NV-DXVK start: One-shot raw-buffer capture on the render command stream.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL csRemixCaptureBuffers() {
+    auto* context = tryGetContext();
+    if (!context) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    std::lock_guard lock { s_mutex };
+    dxvk::D3D11RemixApiAccess::EmitCs(context, [](dxvk::DxvkContext*) {
+      dxvk::RtxContext::triggerScreenshot();
+    });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+  // NV-DXVK end
+
   // Composites the ray-traced image into a texture the host owns. The
   // destination stays on this device, and the work is ordered on the same
   // command stream as the scene description and the host's subsequent UI draws.
@@ -1098,8 +1722,21 @@ extern "C" {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
     std::lock_guard lock { s_mutex };
-    dxvk::D3D11RemixApiAccess::EmitCs(context, [image = texture->GetImage()](dxvk::DxvkContext* dxvkCtx) {
-      static_cast<dxvk::RtxContext*>(dxvkCtx)->injectRTX(0, image);
+    // The Reflex frame ID has to reach the render submit: the submit thread
+    // stamps RENDERSUBMIT_START/END with it, and the driver pairs those with the
+    // simulation and present markers by ID. Passing 0 here (the D3D9 path passes
+    // the live ID) tagged every submit as frame 0 and left the driver's latency
+    // model unable to pair rendering with any frame.
+    dxvk::D3D11RemixApiAccess::EmitCs(context, [image = texture->GetImage(),
+                                                reflexFrameId = context->m_rtx.GetReflexFrameId()](dxvk::DxvkContext* dxvkCtx) {
+      // NV-DXVK start: Submit geometry uploads and skinning before tracing.
+      auto* rtx = static_cast<dxvk::RtxContext*>(dxvkCtx);
+      // RtxContext flushes the upload list, then the separate skinning context.
+      // Both must precede the acceleration-structure builds recorded by injectRTX.
+      rtx->flushCommandList();
+      rtx->getCommonObjects()->metaGeometryUtils().probeSkinning(rtx);
+      rtx->injectRTX(reflexFrameId, image);
+      // NV-DXVK end
     });
     // Ray tracing binds its own shaders, descriptors and state. Re-emit the
     // cached D3D11 state on the same command stream before the host's next draw.

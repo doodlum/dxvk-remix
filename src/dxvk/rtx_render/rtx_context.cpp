@@ -19,9 +19,14 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cmath>
 #include <cassert>
+#include <fstream>
+#include <iomanip>
+#include <locale>
 
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
@@ -78,7 +83,123 @@
 // Destructor requires the struct definitions
 #include "rtx_sky.h"
 
+namespace {
+  // GPU-side phase attribution for the ray-traced frame. Remix's ScopedGpuProfileZone
+  // routes to Tracy, which needs a connected profiler GUI; this writes timestamps into
+  // a small pool and reads them back a few frames later so the breakdown lands in the
+  // log. Enabled by CS_REMIX_GPU_PHASES.
+  struct RtxGpuPhaseTimer {
+    static constexpr uint32_t kMaxMarks = 16;
+    static constexpr uint32_t kRingFrames = 4;
+
+    bool enabled = std::getenv("CS_REMIX_GPU_PHASES") != nullptr;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    dxvk::DxvkDevice* device = nullptr;
+    uint32_t frameSlot = 0;
+    uint32_t markCount = 0;
+    const char* names[kMaxMarks] = {};
+    double accum[kMaxMarks] = {};
+    double gapAccum = 0.0;
+    uint32_t gapSamples = 0;
+    uint32_t samples = 0;
+    float period = 1.0f;
+
+    void begin(dxvk::DxvkContext* ctx) {
+      if (!enabled) {
+        return;
+      }
+      device = ctx->getDevice().ptr();
+      if (pool == VK_NULL_HANDLE) {
+        period = device->properties().core.properties.limits.timestampPeriod;
+        VkQueryPoolCreateInfo info {};
+        info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = kMaxMarks * kRingFrames;
+        if (device->vkd()->vkCreateQueryPool(device->vkd()->device(), &info, nullptr, &pool) != VK_SUCCESS) {
+          enabled = false;
+          return;
+        }
+      }
+      frameSlot = (frameSlot + 1) % kRingFrames;
+      markCount = 0;
+      const uint32_t base = frameSlot * kMaxMarks;
+      device->vkd()->vkCmdResetQueryPool(
+        ctx->getCmdBuffer(dxvk::DxvkCmdBuffer::ExecBuffer), pool, base, kMaxMarks);
+    }
+
+    void mark(dxvk::DxvkContext* ctx, const char* name) {
+      if (!enabled || pool == VK_NULL_HANDLE || markCount >= kMaxMarks) {
+        return;
+      }
+      names[markCount] = name;
+      device->vkd()->vkCmdWriteTimestamp(
+        ctx->getCmdBuffer(dxvk::DxvkCmdBuffer::ExecBuffer),
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, frameSlot * kMaxMarks + markCount);
+      ++markCount;
+    }
+
+    // Reads the oldest ring entry, which is far enough behind that its timestamps
+    // have landed without ever stalling the submitting thread on the GPU.
+    void report() {
+      if (!enabled || pool == VK_NULL_HANDLE || markCount < 2) {
+        return;
+      }
+      const uint32_t readSlot = (frameSlot + 1) % kRingFrames;
+      uint64_t stamps[kMaxMarks] = {};
+      if (device->vkd()->vkGetQueryPoolResults(
+            device->vkd()->device(), pool, readSlot * kMaxMarks, markCount,
+            sizeof(stamps), stamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+        return;
+      }
+      for (uint32_t i = 1; i < markCount; i++) {
+        if (stamps[i] >= stamps[i - 1]) {
+          accum[i] += double(stamps[i] - stamps[i - 1]) * period / 1e6;
+        }
+      }
+      // Gap between the end of the previous ring frame and the start of this one.
+      // This is the decisive number: if the GPU is idle here, the frame is a
+      // pipeline bubble; if it is near zero, the GPU is genuinely saturated and
+      // nvidia-smi's utilisation figure is simply wrong.
+      {
+        const uint32_t prevSlot = (readSlot + kRingFrames - 1) % kRingFrames;
+        uint64_t prevStamps[kMaxMarks] = {};
+        if (device->vkd()->vkGetQueryPoolResults(
+              device->vkd()->device(), pool, prevSlot * kMaxMarks, markCount,
+              sizeof(prevStamps), prevStamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+          const uint64_t prevEnd = prevStamps[markCount - 1];
+          if (stamps[0] > prevEnd && prevEnd != 0) {
+            gapAccum += double(stamps[0] - prevEnd) * period / 1e6;
+            ++gapSamples;
+          }
+        }
+      }
+      if (++samples % 120 == 0) {
+        std::string line;
+        double total = 0.0;
+        for (uint32_t i = 1; i < markCount; i++) {
+          line += dxvk::str::format(names[i], " ", accum[i] / 120.0, " ms | ");
+          total += accum[i] / 120.0;
+          accum[i] = 0.0;
+        }
+        dxvk::Logger::info(dxvk::str::format("[RTX.gpu] ", line, "busy ", total,
+          " ms | idle between frames ", gapSamples ? gapAccum / gapSamples : 0.0,
+          " ms (mean of 120)"));
+        gapAccum = 0.0; gapSamples = 0;
+      }
+    }
+  };
+
+  RtxGpuPhaseTimer g_rtxGpuPhases;
+}
+
 namespace dxvk {
+
+  // Why a frame reaches present without interpolation info: each early-out in
+  // injectRTX that precedes dispatchDLFG() is counted, and the DLFG present
+  // thread logs the deltas beside its own valid/invalid job counts.
+  std::atomic<uint32_t> g_injectSkippedSameFrame{0}, g_injectSkippedCameraInvalid{0},
+                        g_injectSkippedAsyncShaders{0}, g_injectSkippedRtDisabled{0},
+                        g_injectReachedRender{0}, g_dlfgDispatched{0};
 
   Metrics Metrics::s_instance;
 
@@ -99,7 +220,50 @@ namespace dxvk {
     }
 
     auto& exporter = getCommonObjects()->metaExporter();
-    exporter.dumpImageToFile(this, path, str::format(imageName, "_", tm.tm_mday, tm.tm_mon, tm.tm_year, "-", tm.tm_hour, tm.tm_min, tm.tm_sec, ".dds"), image);
+    const auto filename = str::format(imageName, "_", tm.tm_mday, tm.tm_mon, tm.tm_year, "-", tm.tm_hour, tm.tm_min, tm.tm_sec, ".dds");
+    exporter.dumpImageToFile(this, path, filename, image);
+
+    if (imageName == "gbufferLinearZ") {
+      // Use the uploaded ray arguments, not a later host camera snapshot.
+      const auto& args = getResourceManager().getRaytracingOutput().m_raytraceArgs;
+      const auto& camera = args.camera;
+      float jitter[2];
+      getSceneManager().getCamera().getJittering(jitter);
+      std::ofstream metadata(path + filename + ".camera.json", std::ios::trunc);
+      metadata.imbue(std::locale::classic());
+      metadata << std::setprecision(9)
+        << "{\n  \"schema\": 1,\n  \"source\": \"uploaded-raytrace-args\","
+        << "\n  \"runtimeFrame\": " << m_device->getCurrentFrameId()
+        << ",\n  \"rngFrame\": " << args.frameIdx
+        << ",\n  \"depthBuffer\": \"" << filename << "\","
+        << "\n  \"matrixLayout\": \"column-major\","
+        << "\n  \"pixelConvention\": \"top-left origin, pixel centre +0.5, NDC y flipped\","
+        << "\n  \"resolution\": [" << camera.resolution.x << ", " << camera.resolution.y << "],"
+        << "\n  \"depthExtent\": [" << image->info().extent.width << ", " << image->info().extent.height << "],"
+        << "\n  \"cameraFlags\": " << camera.flags
+        << ",\n  \"pixelJitter\": [" << jitter[0] << ", " << jitter[1] << "]";
+      const auto writeMatrix = [&metadata](const char* name, const mat4& matrix) {
+        float values[16];
+        static_assert(sizeof(values) == sizeof(matrix));
+        std::memcpy(values, &matrix, sizeof(values));
+        metadata << ",\n  \"" << name << "\": [";
+        for (uint32_t i = 0; i < 16; ++i) {
+          metadata << (i ? ", " : "") << values[i];
+        }
+        metadata << "]";
+      };
+      writeMatrix("worldToView", camera.worldToView);
+      writeMatrix("viewToWorld", camera.viewToWorld);
+      writeMatrix("viewToProjection", camera.viewToProjection);
+      writeMatrix("viewToProjectionJittered", camera.viewToProjectionJittered);
+      writeMatrix("projectionToViewJittered", camera.projectionToViewJittered);
+      writeMatrix("translatedWorldToView", camera.translatedWorldToView);
+      metadata << "\n}\n";
+      metadata.close();
+      if (!metadata) {
+        Logger::err(str::format("[CSRemix.buffers] Failed to write camera metadata for ", filename));
+      }
+    }
   }
 
   void RtxContext::blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter) {
@@ -596,6 +760,7 @@ namespace dxvk {
     }
 
     if (m_frameLastInjected == m_device->getCurrentFrameId()) {
+      ++g_injectSkippedSameFrame;
       return;
     }
 
@@ -646,7 +811,11 @@ namespace dxvk {
 
     // Note: Only engage ray tracing when it is enabled, the camera is valid and when no shaders are currently being compiled asynchronously (as
     // trying to render before shaders are done compiling will cause Remix to block).
+    if (!isCameraValid) { ++g_injectSkippedCameraInvalid; }
+    else if (asyncShaderCompilationActive) { ++g_injectSkippedAsyncShaders; }
+    else if (!isRaytracingEnabled) { ++g_injectSkippedRtDisabled; }
     if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive) {
+      ++g_injectReachedRender;
       if (targetImage == nullptr) {
         targetImage = m_state.om.renderTargets.color[0].view->image();  
       }
@@ -698,8 +867,24 @@ namespace dxvk {
       m_submitContainsInjectRtx = true;
       m_cachedReflexFrameId = cachedReflexFrameId;
 
-      // Update all the GPU buffers needed to describe the scene
-      getSceneManager().prepareSceneData(this, m_execBarriers);
+      // Update all the GPU buffers needed to describe the scene.
+      // Timed: the host measured its frame as CPU bound with most of the cost
+      // inside this runtime rather than in its own submission or in the game,
+      // and this is the largest single phase.
+      {
+        static double sceneTotal = 0.0;
+        static uint32_t sceneSamples = 0;
+        const auto sceneStart = std::chrono::steady_clock::now();
+        g_rtxGpuPhases.begin(this);
+        g_rtxGpuPhases.mark(this, "start");
+        getSceneManager().prepareSceneData(this, m_execBarriers);
+        sceneTotal += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - sceneStart).count();
+        if (++sceneSamples % 120 == 0) {
+          Logger::info(str::format("[CSRemix.CPU] prepareSceneData ", sceneTotal / 120.0, " ms/frame (mean of 120)"));
+          sceneTotal = 0.0;
+        }
+      }
       
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       if (getSceneManager().getSurfaceBuffer() != nullptr) {
@@ -721,11 +906,14 @@ namespace dxvk {
         // Generate ray tracing constant buffer
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
 
+        g_rtxGpuPhases.mark(this, "scenePrep");
         // Volumetric Lighting
         dispatchVolumetrics(rtOutput);
+        g_rtxGpuPhases.mark(this, "volumetrics");
         
         // Path Tracing
         dispatchPathTracing(rtOutput);
+        g_rtxGpuPhases.mark(this, "pathTrace");
 
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
@@ -735,8 +923,13 @@ namespace dxvk {
 
         // ReSTIR GI
         m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
+        g_rtxGpuPhases.mark(this, "nrc+rtxdi+restir");
         
         if (captureScreenImage && captureDebugImage) {
+          // Composite can enhance PrimaryAlbedo; preserve its material value before that pass.
+          takeScreenshot("gbufferAlbedo", rtOutput.m_primaryAlbedo.image);
+          takeScreenshot("gbufferLinearZ", rtOutput.m_primaryLinearViewZ.image);
+          takeScreenshot("gbufferWorldNormals", rtOutput.m_primaryWorldShadingNormal.image);
           takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
           takeScreenshot("sharedSubsurfaceData", rtOutput.m_sharedSubsurfaceData.image);
           takeScreenshot("sharedSubsurfaceDiffusionProfileData", rtOutput.m_sharedSubsurfaceDiffusionProfileData.image);
@@ -753,6 +946,7 @@ namespace dxvk {
 
         // Denoising
         dispatchDenoise(rtOutput);
+        g_rtxGpuPhases.mark(this, "denoise");
 
         // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
         if (captureScreenImage && captureDebugImage) {
@@ -762,6 +956,7 @@ namespace dxvk {
 
         // Composition
         dispatchComposite(rtOutput);
+        g_rtxGpuPhases.mark(this, "composite");
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
@@ -799,10 +994,21 @@ namespace dxvk {
             { 0, 0, 0 },
             rtOutput.m_compositeOutputExtent);
         }
+        g_rtxGpuPhases.mark(this, "upscale");
+        g_rtxGpuPhases.report();
         m_previousUpscaler = m_currentUpscaler;
 
         RtxDustParticles& dust = m_common->metaDustParticles();
         dust.simulateAndDraw(this, m_state, rtOutput);
+
+        if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED ||
+            m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PAIRED_SURFACE_FRAME ||
+            m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PAIRED_COMPOSITE_FRAME ||
+            m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PAIRED_MATERIAL_FRAME ||
+            m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PAIRED_ALPHA_COMPOSITE_FRAME ||
+            m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PAIRED_LIGHTING_FRAME) {
+          m_common->metaPostFx().dispatchNativeRefraction(this, rtOutput);
+        }
 
         dispatchBloom(rtOutput);
 
@@ -1299,6 +1505,7 @@ namespace dxvk {
     constants.terrainArgs = getSceneManager().getTerrainBaker().getTerrainArgs();
 
     constants.sssArgs.enableThinOpaque = RtxOptions::SubsurfaceScattering::enableThinOpaque();
+    constants.sssArgs.enableTextureMaps = RtxOptions::SubsurfaceScattering::enableTextureMaps();
     constants.sssArgs.enableDiffusionProfile = RtxOptions::SubsurfaceScattering::enableDiffusionProfile();
     constants.sssArgs.diffusionProfileScale = std::max(RtxOptions::SubsurfaceScattering::diffusionProfileScale(), 0.001f);
     constants.enableSssTransmission = RtxOptions::SubsurfaceScattering::enableTransmission();
@@ -1389,12 +1596,15 @@ namespace dxvk {
       const DebugView& debugView = m_common->metaDebugView();
       constants.debugView = debugView.debugViewIdx();
       constants.debugKnob = debugView.debugKnob();
+      constants.debugKnob.w = debugView.foliageDiffuseTransmission() ? 1.0f : 0.0f;
       constants.forceFirstHitInGBufferPass = debugView.showFirstGBufferHit();
       
       constants.gpuPrintThreadIndex = u16vec2 { kInvalidThreadIndex, kInvalidThreadIndex };
       constants.gpuPrintElementIndex = frameIdx % kMaxFramesInFlight;
 
-      if (debugView.gpuPrint.enable() && ImGui::IsKeyDown(ImGuiKey_ModCtrl)) {
+      if (debugView.gpuPrint.enable() && (!debugView.gpuPrint.requireCtrl() || ImGui::IsKeyDown(ImGuiKey_ModCtrl))) {
+        constants.debugKnob.x = float(debugView.gpuPrint.nativeEffectFlags());
+        constants.debugKnob.y = float(debugView.gpuPrint.nativeEffectPhase());
         if (debugView.gpuPrint.useMousePosition()) {
           Vector2 toDownscaledExtentScale{
             downscaledExtent.width / static_cast<float>(targetExtent.width),
@@ -2289,6 +2499,7 @@ namespace dxvk {
     if (!isDLFGEnabled()) {
       return;
     }
+    ++g_dlfgDispatched;
 
     // force vsync off if DLFG is enabled, as we don't properly support FG + vsync
     if (RtxOptions::enableVsyncState != EnableVsync::Off) {

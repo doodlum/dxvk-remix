@@ -92,9 +92,16 @@ void skinning(const uint32_t idx,
                     srcNormal[baseSrcNormalOffset + 2], 0.f);
   }
 
-  // Do the skinning
+  float4 normalY = float4(0.f), normalZ = float4(0.f);
+  if (cb.modelSpaceNormals) {
+    normalY = float4(srcNormal[baseSrcNormalOffset + 3], srcNormal[baseSrcNormalOffset + 4], srcNormal[baseSrcNormalOffset + 5], 0.f);
+    normalZ = float4(srcNormal[baseSrcNormalOffset + 6], srcNormal[baseSrcNormalOffset + 7], srcNormal[baseSrcNormalOffset + 8], 0.f);
+  }
+
+  // Model-space maps carry three orientation columns through the same bone blend.
   float4 positionOut = float4(0.f);
   float4 normalOut = float4(0.f);
+  float4 normalYOut = float4(0.f), normalZOut = float4(0.f);
   if (cb.useIndices) {
     const uint baseIndicesOffset = cb.blendIndicesOffset + idx * cb.blendIndicesStride;
     for (uint j = 0; j < cb.numBones; j+=4) {
@@ -105,6 +112,10 @@ void skinning(const uint32_t idx,
           Matrix4 bone = toMatrix4(cb.bones[blendIndices[i]]);
           positionOut += mul(bone, position) * blendWeight;
           normalOut += mul(bone, normal) * blendWeight;
+          if (cb.modelSpaceNormals) {
+            normalYOut += mul(bone, normalY) * blendWeight;
+            normalZOut += mul(bone, normalZ) * blendWeight;
+          }
         }
       }
     }
@@ -115,6 +126,10 @@ void skinning(const uint32_t idx,
         Matrix4 bone = toMatrix4(cb.bones[i]);
         positionOut += mul(bone, position) * blendWeight;
         normalOut += mul(bone, normal) * blendWeight;
+        if (cb.modelSpaceNormals) {
+          normalYOut += mul(bone, normalY) * blendWeight;
+          normalZOut += mul(bone, normalZ) * blendWeight;
+        }
       }
     }
     // Unwrap the last bone, since blendWeights only contains numBones - 1 weights
@@ -122,6 +137,10 @@ void skinning(const uint32_t idx,
       Matrix4 bone = toMatrix4(cb.bones[cb.numBones - 1]);
       positionOut += mul(bone, position) * lastWeight;
       normalOut += mul(bone, normal) * lastWeight;
+      if (cb.modelSpaceNormals) {
+        normalYOut += mul(bone, normalY) * lastWeight;
+        normalZOut += mul(bone, normalZ) * lastWeight;
+      }
     }
   }
 
@@ -144,6 +163,19 @@ void skinning(const uint32_t idx,
     dstNormal[baseDstNormalOffset + 0] = newNormal.x;
     dstNormal[baseDstNormalOffset + 1] = newNormal.y;
     dstNormal[baseDstNormalOffset + 2] = newNormal.z;
+    if (cb.modelSpaceNormals) {
+      float3 newY = float3(normalYOut.x, normalYOut.y, normalYOut.z);
+      float3 newZ = float3(normalZOut.x, normalZOut.y, normalZOut.z);
+      const float lengthY = length(newY), lengthZ = length(newZ);
+      if (lengthY > 0.f) { newY /= lengthY; }
+      if (lengthZ > 0.f) { newZ /= lengthZ; }
+      dstNormal[baseDstNormalOffset + 3] = newY.x;
+      dstNormal[baseDstNormalOffset + 4] = newY.y;
+      dstNormal[baseDstNormalOffset + 5] = newY.z;
+      dstNormal[baseDstNormalOffset + 6] = newZ.x;
+      dstNormal[baseDstNormalOffset + 7] = newZ.y;
+      dstNormal[baseDstNormalOffset + 8] = newZ.z;
+    }
   }
 }
 

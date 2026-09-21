@@ -733,6 +733,21 @@ void geometryResolverVertexOutputDebugView(
     storeInDebugView(pixelCoordinate, shadingNormal);
 
     break;
+  // NV-DXVK start: View-facing hemisphere required by opaque BSDF evaluation.
+  case DEBUG_VIEW_SHADING_NORMAL_FACING:
+  {
+    vec3 facingColor = vec3(0, 0, 1);
+    if (materialType == surfaceMaterialTypeOpaque)
+    {
+      const vec3 normal = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction).shadingNormal;
+      const float normalDotView = dot(normal, rayInteraction.viewDirection);
+      facingColor = isnan(normalDotView) || isinf(normalDotView) ? vec3(1, 0, 1) :
+        (normalDotView < materialEpsilon ? vec3(1, 0, 0) : vec3(0, 1, 0));
+    }
+    storeInDebugView(pixelCoordinate, facingColor);
+    break;
+  }
+  // NV-DXVK end
   case DEBUG_VIEW_VERTEX_COLOR:
     storeInDebugView(pixelCoordinate, surfaceInteraction.vertexColor);
 
@@ -781,6 +796,7 @@ void geometryResolverVertexOutputDebugView(
 
     break;
   }
+  case DEBUG_VIEW_PAIRED_SURFACE_FRAME:
   case DEBUG_VIEW_ALBEDO:
     vec3 albedo = vec3(0.0f);
 
@@ -1241,6 +1257,68 @@ void geometryResolverVertexOutputDebugView(
     storeInDebugView(pixelCoordinate, isThinOpaque ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0));
 
     break;
+  // NV-DXVK start: Resolved scattering input, including native foliage colour.
+  case DEBUG_VIEW_THIN_SCATTERING_COLOR:
+    vec3 scatteringColor = vec3(0.0f);
+    if (materialType == surfaceMaterialTypeOpaque)
+    {
+      const OpaqueSurfaceMaterialInteraction scatteringMaterial = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction);
+      if (isThinOpaqueSubsurfaceMaterial(scatteringMaterial))
+      {
+        scatteringColor = usesNativeFoliageResponse(scatteringMaterial) ?
+          (nativeFoliageProjectedWeight(scatteringMaterial, 0.0f) + nativeFoliageProjectedWeight(scatteringMaterial, -1.0f)) * pi :
+          r11g11b10ToColor(scatteringMaterial.subsurfaceMaterialInteraction.packedSingleScatteringAlbedo);
+      }
+    }
+    storeInDebugView(pixelCoordinate, scatteringColor);
+    break;
+  case DEBUG_VIEW_NATIVE_FOLIAGE_INPUTS:
+    vec3 foliageInputColor = vec3(0.0f);
+    if (materialType == surfaceMaterialTypeOpaque)
+    {
+      const OpaqueSurfaceMaterial foliageMaterial = opaqueSurfaceMaterialCreate(surfaceMaterials[rayInteraction.surfaceIndex]);
+      if (foliageMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_FOLIAGE)
+      {
+        const NativeFoliageStorage foliage = reinterpret<NativeFoliageStorage>(foliageMaterial);
+        if (!(foliage.flags & NATIVE_FOLIAGE_GRASS))
+        {
+          vec4 rawAlbedo = vec4(foliageMaterial.albedoOpacityConstant);
+          vec4 rawSoft = vec4(0.0f);
+          surfaceMaterialInteractionTextureReadHelper(foliageMaterial.albedoOpacityTextureIndex,
+            foliageMaterial.samplerIndex, surfaceInteraction, rawAlbedo);
+          if (foliage.flags & NATIVE_FOLIAGE_SOFT)
+          {
+            surfaceMaterialInteractionTextureReadHelper(foliage.softLightTexture,
+              foliageMaterial.samplerIndex, surfaceInteraction, rawSoft);
+          }
+          const NativeFoliageResponse response = nativeFoliageResponseCreate(foliageMaterial,
+            surfaceInteraction, rawAlbedo.rgb, false);
+          foliageInputColor = rawSoft.rgb;
+          // w identifies the frame-cycled probe: albedo, soft map, linear product, parameters.
+          const uint phase = cb.frameIdx % 4u;
+          const vec3 probe = phase == 0u ? rawAlbedo.rgb : phase == 1u ? rawSoft.rgb :
+            phase == 2u ? response.softColor : vec3(foliage.rolloff, foliage.colorGamma, foliage.diffuseScale);
+          GpuPrint::write(u16vec2(pixelCoordinate), vec4(probe, float(phase)));
+        }
+      }
+    }
+    storeInDebugView(pixelCoordinate, foliageInputColor);
+    break;
+  case DEBUG_VIEW_NATIVE_GRASS_KIND:
+    vec3 grassKindColor = vec3(0.0f);
+    if (materialType == surfaceMaterialTypeOpaque)
+    {
+      const OpaqueSurfaceMaterial grassMaterial = reinterpret<OpaqueSurfaceMaterial>(surfaceMaterials[rayInteraction.surfaceIndex]);
+      if ((grassMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_FOLIAGE) &&
+          (reinterpret<NativeFoliageStorage>(grassMaterial).flags & NATIVE_FOLIAGE_GRASS))
+      {
+        // Green: ordinary grass; blue: complex atlas; black: other surfaces.
+        grassKindColor = nativeGrassCoordinates(grassMaterial, surfaceInteraction) ? vec3(0.0f, 0.0f, 1.0f) : vec3(0.0f, 1.0f, 0.0f);
+      }
+    }
+    storeInDebugView(pixelCoordinate, grassKindColor);
+    break;
+  // NV-DXVK end
   case DEBUG_VIEW_IS_SUBSURFACE_SCATTERING:
     bool isSss = false;
     if (materialType == surfaceMaterialTypeOpaque)
@@ -1251,6 +1329,73 @@ void geometryResolverVertexOutputDebugView(
     storeInDebugView(pixelCoordinate, isSss ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0));
 
     break;
+  // NV-DXVK start: Authored MSN diagnostic, independent of reflection normal bending.
+  case DEBUG_VIEW_HIT_POSITION_CONSISTENCY:
+    const vec3 hardwarePosition = rayEvaluate(ray, rayInteraction.hitDistance);
+    const vec4 hitConsistency = vec4(length(hardwarePosition - surfaceInteraction.position),
+      cameraWorldPosToLinearViewZ(cb.camera, hardwarePosition),
+      cameraWorldPosToLinearViewZ(cb.camera, surfaceInteraction.position),
+      rayInteraction.frontHit ? 1.0f : 0.0f);
+    storeInDebugView(pixelCoordinate, hitConsistency);
+    GpuPrint::write(u16vec2(pixelCoordinate), hitConsistency);
+    break;
+  case DEBUG_VIEW_HIT_GEOMETRY_IDENTITY:
+    const vec4 hitIdentity = vec4(float(rayInteraction.surfaceIndex), float(primitiveIndex),
+      float(surface.positionBufferIndex), float(surface.indexBufferIndex));
+    storeInDebugView(pixelCoordinate, hitIdentity);
+    GpuPrint::write(u16vec2(pixelCoordinate), hitIdentity);
+    break;
+  case DEBUG_VIEW_NEXT_UNSHIFTED_HIT:
+    // First-hit diagnostic only: retain the incoming line and advance by one T ULP.
+    RayDesc nextRay;
+    nextRay.Origin = ray.origin;
+    nextRay.Direction = ray.direction;
+    nextRay.TMin = asfloat(asuint(rayInteraction.hitDistance) + 1u);
+    nextRay.TMax = floatMax;
+    const uint nextMask = OBJECT_MASK_ALL | OBJECT_MASK_VIEWMODEL | OBJECT_MASK_PLAYER_MODEL_VIRTUAL |
+      (cb.enablePlayerModelInPrimarySpace ? OBJECT_MASK_PLAYER_MODEL : 0u);
+    const uint nextFlags = RAY_FLAG_FORCE_OPAQUE |
+      (cb.startInMediumMaterialIndex != SURFACE_INDEX_INVALID ? 0u : RAY_FLAG_CULL_BACK_FACING_TRIANGLES);
+    RayQuery<0> nextQuery = RayQuery<0>();
+    nextQuery.TraceRayInline(topLevelAS, nextFlags, nextMask, nextRay);
+    while (nextQuery.Proceed()) {}
+    vec4 nextDiagnostic = vec4(-1.0f);
+    if (nextQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+    {
+      RAY_HIT_INFO_CREATE_RAY_QUERY_COMMITTED(nextHit, nextQuery)
+      const uint nextSurface = calculateSurfaceIndex(nextHit);
+      const bool repeatedPrimitive = nextSurface == rayInteraction.surfaceIndex &&
+        nextHit.primitiveIndex == primitiveIndex;
+      nextDiagnostic = vec4(cameraWorldPosToLinearViewZ(cb.camera, rayEvaluate(ray, nextHit.hitDistance)),
+        nextHit.hitDistance - rayInteraction.hitDistance,
+        repeatedPrimitive ? -2.0f : float(nextSurface), float(nextHit.primitiveIndex));
+    }
+    storeInDebugView(pixelCoordinate, nextDiagnostic);
+    GpuPrint::write(u16vec2(pixelCoordinate), nextDiagnostic);
+    break;
+  case DEBUG_VIEW_SKIN_DIFFUSION_DISTANCE:
+    storeInDebugView(pixelCoordinate, vec4(0.0f));
+    break;
+  case DEBUG_VIEW_SKIN_AUTHORED_NORMAL:
+    vec4 authoredNormalColor = vec4(0.0f);
+    if (materialType == surfaceMaterialTypeOpaque && surface.modelSpaceNormals &&
+        isSubsurfaceDiffusionProfileMaterial(opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction)))
+    {
+      const OpaqueSurfaceMaterial skinMaterial = opaqueSurfaceMaterialCreate(surfaceMaterials[rayInteraction.surfaceIndex]);
+      vec4 skinNormalSample;
+      if (surfaceMaterialInteractionTextureReadHelper(skinMaterial.normalTextureIndex,
+          skinMaterial.samplerIndex, surfaceInteraction, skinNormalSample))
+      {
+        const vec3 modelNormal = skinNormalSample.xzy * 2.0f - 1.0f;
+        const vec3 authoredNormal = normalize(surfaceInteraction.modelNormalX * modelNormal.x +
+          surfaceInteraction.modelNormalY * modelNormal.y + surfaceInteraction.modelNormalZ * modelNormal.z);
+        // Alpha marks an actual sampled MSN diffusion material; black denotes other surfaces.
+        authoredNormalColor = vec4(authoredNormal * 0.5f + 0.5f, 1.0f);
+      }
+    }
+    storeInDebugView(pixelCoordinate, authoredNormalColor);
+    break;
+  // NV-DXVK end
   case DEBUG_VIEW_POM_ITERATIONS:
 #ifdef OPAQUE_MATERIAL_USE_POM
     if (materialType == surfaceMaterialTypeOpaque && cb.pomMode != DisplacementMode::Off)
@@ -1377,6 +1522,7 @@ void geometryResolverOutputPrimaryMaterialDebugView(
     storeInDebugView(pixelCoordinate, shadingNormal);
     break;
   }
+  case DEBUG_VIEW_PAIRED_SURFACE_FRAME:
   case DEBUG_VIEW_ALBEDO:
   {
     vec3 albedo = vec3(0.0f);
@@ -1681,6 +1827,9 @@ void geometryResolverVertex(
   EmptyExtraArgs extraArgs, RayHitInfo rayHitInfo,
   inout GeometryResolverState geometryResolverState)
 {
+  // NV-DXVK start: Unordered and material resolution consume only this interval.
+  beginResolveSegment(rayHitInfo, geometryResolverState);
+  // NV-DXVK end
   // Setup resolve state
 
   // Note: Emissives are fine to approximate even on primary rays (since lighting rarely
@@ -2338,6 +2487,9 @@ void geometryPSRResolverVertex(
   EmptyExtraArgs extraArgs, RayHitInfo rayHitInfo,
   inout GeometryPSRResolverState geometryPSRResolverState)
 {
+  // NV-DXVK start: Unordered and material resolution consume only this interval.
+  beginResolveSegment(rayHitInfo, geometryPSRResolverState);
+  // NV-DXVK end
   // Setup resolve state
   uint8_t psrType = geometryPSRResolverState.isTransmissionPSR ? psrTypeTransmission : psrTypeReflection;
 

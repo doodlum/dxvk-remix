@@ -21,8 +21,10 @@
 */
 #include <limits>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
+#include <chrono>
 #include "rtx_asset_replacer.h"
 #include "rtx_scene_manager.h"
 #include "rtx_opacity_micromap_manager.h"
@@ -52,6 +54,13 @@
 #include "../util/util_struct_hash.h"
 
 #include "rtx/pass/particles/particle_system_common.h"
+
+namespace {
+  // Opt-in via CS_REMIX_PRESERVE_SPLIT: reports how the retained-replay time
+  // divides between SceneManager and InstanceManager, at the cost of three
+  // clock reads per preserved instance.
+  const bool kMeasurePreserveSplit = std::getenv("CS_REMIX_PRESERVE_SPLIT") != nullptr;
+}
 
 namespace {
   // helper function to ensure generating spatialMapHash for external draws is done the same way in multiple places.
@@ -172,6 +181,15 @@ namespace dxvk {
   void SceneManager::initialize(Rc<DxvkContext> ctx) {
     ScopedCpuProfileZone();
     m_pReplacer->initialize(ctx);
+
+    // A retained registration holds its node directly, so it has to hear about
+    // the node dying before anything reads the pointer again.
+    m_drawCallTracker.setHostNodeDestroyedCallback([this](uint64_t handle) {
+      const auto found = m_retainedExternalIndex.find(handle);
+      if (found != m_retainedExternalIndex.end()) {
+        m_retainedExternalDraws[found->second].node = nullptr;
+      }
+    });
   }
 
   void SceneManager::logStatistics() {
@@ -266,6 +284,11 @@ namespace dxvk {
     // Clear ReplacementInstances first: their destructors call clear() which
     // accesses prims[] to mark entities for GC and clear back-pointers.
     // Entities must still be alive at this point.
+    if (env::getEnvVar("CS_REMIX_AUDIT_RETAINED") == "1" &&
+        !m_drawCallTracker.getReplacementInstances().empty()) {
+      Logger::info(str::format("[CSRemix.retainedClear] frame=", m_device->getCurrentFrameId(),
+          " nodes=", m_drawCallTracker.getReplacementInstances().size()));
+    }
     m_drawCallTracker.clear();
 
     // Called before instance manager's clear, so that it resets all tracked instances in Opacity Micromap manager at once
@@ -779,6 +802,12 @@ namespace dxvk {
     const bool legacyMaterialIdentityHashMatch =
         replacementInstance->legacyMaterialIdentityHash == legacyMaterialIdentityHash;
 
+    // Measured 2026-09-19: this fast path is unreachable for API draws.
+    // SceneManager::submitExternalDraw calls processDrawCallState directly and
+    // never passes through here, so every one of the ~8,300 retained draws the
+    // host replays takes the full dynamic update every frame. That replay costs
+    // 14.8 ms of a 26.9 ms frame on the CS thread, of which only 1.4 ms is the
+    // state copy; the rest is re-deriving draw state that did not change.
     const bool usePreservePath =
         RtxOptions::enablePreservePath() &&
         !replacementInstance->prims.empty() &&
@@ -1846,6 +1875,38 @@ namespace dxvk {
       // Not a constructor argument: this describes how the imported texture must
       // be read, and the texture is already part of the material identity.
       opaqueSurfaceMaterial.setNativeSrgbAlbedo(opaqueMaterialData.getNativeSrgbAlbedo());
+      opaqueSurfaceMaterial.setNativeRgbNormal(opaqueMaterialData.getNativeRgbNormal());
+      if (const auto& foliage = opaqueMaterialData.getNativeFoliage()) {
+        uint32_t softLight = kSurfaceMaterialInvalidTextureIndex;
+        uint32_t backLight = kSurfaceMaterialInvalidTextureIndex;
+        trackTexture(foliage->softLight, softLight, hasTexcoords, true, &samplerFeedbackStamp);
+        trackTexture(foliage->backLight, backLight, hasTexcoords, true, &samplerFeedbackStamp);
+        opaqueSurfaceMaterial.setNativeFoliage(foliage, uint16_t(softLight), uint16_t(backLight));
+      }
+
+      // A host's effect resolves colour and alpha through a palette texture,
+      // sampled with its own clamping sampler rather than the material's.
+      if (const auto& effect = opaqueMaterialData.getNativeEffect()) {
+        uint32_t palette = kSurfaceMaterialInvalidTextureIndex;
+        trackTexture(effect->palette, palette, hasTexcoords, true, &samplerFeedbackStamp);
+        opaqueSurfaceMaterial.setNativeEffect(effect, uint16_t(palette),
+          uint16_t(trackSampler(effect->paletteSampler)));
+      }
+
+      // Terrain's five albedo and five normal layers. They are ordinary bindless
+      // textures; only the blend weights, which ride on the mesh, are special.
+      if (const auto& landscape = opaqueMaterialData.getNativeLandscape()) {
+        std::array<uint16_t, 10> landscapeTextureIndices;
+        for (uint32_t layer = 0; layer < 5; ++layer) {
+          uint32_t albedo = kSurfaceMaterialInvalidTextureIndex;
+          uint32_t normal = kSurfaceMaterialInvalidTextureIndex;
+          trackTexture(landscape->albedo[layer], albedo, hasTexcoords, true, &samplerFeedbackStamp);
+          trackTexture(landscape->normal[layer], normal, hasTexcoords, true, &samplerFeedbackStamp);
+          landscapeTextureIndices[layer] = uint16_t(albedo);
+          landscapeTextureIndices[5 + layer] = uint16_t(normal);
+        }
+        opaqueSurfaceMaterial.setNativeLandscape(landscapeTextureIndices, landscape->srgbMask);
+      }
 
       surfaceMaterial.emplace(opaqueSurfaceMaterial);
     } else if (renderMaterialDataType == MaterialDataType::Translucent) {
@@ -1896,7 +1957,7 @@ namespace dxvk {
     trackTexture(translucentMaterialData.getTransmittanceTexture(), transmittanceTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
     trackTexture(translucentMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
 
-    return RtTranslucentSurfaceMaterial{
+    RtTranslucentSurfaceMaterial material{
       normalTextureIndex,
       transmittanceTextureIndex,
       emissiveColorTextureIndex,
@@ -1912,6 +1973,27 @@ namespace dxvk {
       samplerIndex,
       samplerFeedbackStamp
     };
+
+    // A host's water: three scrolling world-space normal layers plus a flow
+    // atlas and its normal, sampled through the atlas's own clamping sampler.
+    if (const auto& water = translucentMaterialData.getNativeWater()) {
+      std::array<uint16_t, 4> indices;
+      indices.fill(uint16_t(kSurfaceMaterialInvalidTextureIndex));
+      for (uint32_t i = 0; i < 4; ++i) {
+        uint32_t textureIndex = kSurfaceMaterialInvalidTextureIndex;
+        trackTexture(water->extraNormals[i], textureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+        indices[i] = uint16_t(textureIndex);
+      }
+      material.setNativeWater(water, indices, uint16_t(trackSampler(water->flowSampler)));
+      ONCE(Logger::info(str::format("[CSRemix] native water surface material created: normals ",
+        indices[0], "/", indices[1], "/", indices[2], "/", indices[3],
+        " hasTexcoords=", hasTexcoords,
+        " valid=", water->extraNormals[0].isValid(), water->extraNormals[1].isValid(),
+        water->extraNormals[2].isValid(), water->extraNormals[3].isValid(),
+        " hash=", water->extraNormals[2].getImageHash(), "/", water->extraNormals[3].getImageHash())));
+    }
+
+    return material;
   }
 
   Rc<DxvkSampler> SceneManager::getOrCreateExternalSampler() {
@@ -2191,13 +2273,28 @@ namespace dxvk {
     // Needs to happen before garbageCollection to avoid destroying dynamic lights
     m_lightManager.dynamicLightMatching();
 
-    garbageCollection();
+    {
+      static double gcTotal = 0.0;
+      static uint32_t gcSamples = 0;
+      const auto gcStart = std::chrono::steady_clock::now();
+      garbageCollection();
+      gcTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - gcStart).count();
+      if (++gcSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] garbageCollection ", gcTotal / 120.0, " ms/frame (mean of 120)"));
+        gcTotal = 0.0;
+      }
+    }
 
     // Re-register buffers, textures, and materials for anti-culled instances.
     // These instances survived GC but the game didn't submit draw calls for them
     // this frame, so their per-frame table indices (buffer cache, material cache)
     // are stale. Without this, they would render with wrong geometry or textures.
     {
+      static double antiTotal = 0.0;
+      static uint32_t antiSamples = 0;
+      static uint32_t antiPreserved = 0;
+      const auto antiStart = std::chrono::steady_clock::now();
       const uint32_t currentFrameId = m_device->getCurrentFrameId();
       for (auto& ri : m_drawCallTracker.getReplacementInstances()) {
         if (ri->frameLastSeen == currentFrameId) {
@@ -2207,9 +2304,74 @@ namespace dxvk {
           RtInstance* instance = prim.getInstance();
           if (instance != nullptr) {
             preserveInstance(*instance);
+            ++antiPreserved;
           }
         }
       }
+      antiTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - antiStart).count();
+      if (++antiSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] anti-culled re-register ", antiTotal / 120.0,
+          " ms/frame (mean of 120), preserved ", antiPreserved / 120));
+        antiTotal = 0.0;
+        antiPreserved = 0;
+      }
+    }
+
+    // Opt-in ownership census after retirement, before acceleration structures
+    // consume the live instance table. No GPU readback or rendering policy changes.
+    static const bool auditRetained = env::getEnvVar("CS_REMIX_AUDIT_RETAINED") == "1";
+    if (auditRetained) {
+      const uint32_t auditFrame = m_device->getCurrentFrameId();
+      std::unordered_set<const ReplacementInstance*> nodes;
+      for (const auto& pNode : m_drawCallTracker.getReplacementInstances()) {
+        nodes.insert(pNode.get());
+      }
+      uint32_t badEntries = 0, badOwners = 0, badPrims = 0, marked = 0;
+      uint32_t unowned = 0, staleUnowned = 0, hostNodes = 0;
+      for (const auto& entry : m_retainedExternalDraws) {
+        if (entry.node != nullptr && (!nodes.count(entry.node) ||
+            !entry.node->hostOwned || entry.node->hostRetainedHandle != entry.handle)) {
+          ++badEntries;
+        }
+      }
+      for (const auto* pNode : nodes) {
+        if (pNode->hostOwned) {
+          ++hostNodes;
+          const auto owner = m_retainedExternalIndex.find(pNode->hostRetainedHandle);
+          if (owner == m_retainedExternalIndex.end() ||
+              m_retainedExternalDraws[owner->second].node != pNode) {
+            ++badOwners;
+          }
+        }
+      }
+      for (auto* pInstance : m_instanceManager.getInstanceTable()) {
+        marked += pInstance->isMarkedForGC();
+        const auto& owner = pInstance->getPrimInstanceOwner();
+        const auto* pNode = owner.getReplacementInstance();
+        if (pNode == nullptr) {
+          ++unowned;
+          continue;
+        }
+        if (!nodes.count(pNode) || owner.getReplacementIndex() >= pNode->prims.size() ||
+            pNode->prims[owner.getReplacementIndex()].getInstance() != pInstance) {
+          ++badPrims;
+          continue;
+        }
+        if (!pNode->hostOwned) {
+          ++unowned;
+          staleUnowned += pNode->frameLastSeen != auditFrame;
+        }
+      }
+      static uint64_t auditedFrames = 0, violationFrames = 0;
+      ++auditedFrames;
+      violationFrames += (badEntries || badOwners || badPrims || marked);
+      Logger::info(str::format("[CSRemix.retainedAudit] frame=", auditFrame,
+        " samples=", auditedFrames, " violationFrames=", violationFrames,
+        " draws=", m_retainedExternalDraws.size(), " nodes=", nodes.size(),
+        " hostNodes=", hostNodes, " instances=", m_instanceManager.getActiveCount(),
+        " badEntries=", badEntries, " badOwners=", badOwners, " badPrims=", badPrims,
+        " gcMarked=", marked, " unowned=", unowned, " staleUnowned=", staleUnowned));
     }
 
     m_graphManager.applySceneOverrides(ctx);
@@ -2217,7 +2379,18 @@ namespace dxvk {
     m_terrainBaker->prepareSceneData(ctx);
 
     auto& textureManager = m_device->getCommon()->getTextureManager();
-    m_bindlessResourceManager.prepareSceneData(ctx, textureManager.getTextureTable(), getBufferTable(), getSamplerTable());
+    {
+      static double blTotal = 0.0;
+      static uint32_t blSamples = 0;
+      const auto blStart = std::chrono::steady_clock::now();
+      m_bindlessResourceManager.prepareSceneData(ctx, textureManager.getTextureTable(), getBufferTable(), getSamplerTable());
+      blTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - blStart).count();
+      if (++blSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] bindlessResourceManager ", blTotal / 120.0, " ms/frame (mean of 120)"));
+        blTotal = 0.0;
+      }
+    }
 
     // If there are no instances, we should do nothing!
     if (m_instanceManager.getActiveCount() == 0) {
@@ -2330,11 +2503,47 @@ namespace dxvk {
     m_instanceManager.createViewModelInstances(ctx, m_cameraManager, m_rayPortalManager);
     m_instanceManager.createPlayerModelVirtualInstances(ctx, m_cameraManager, m_rayPortalManager);
 
-    m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
+    {
+      static double mergeTotal = 0.0;
+      static uint32_t mergeSamples = 0;
+      const auto mergeStart = std::chrono::steady_clock::now();
+      m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
+      mergeTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - mergeStart).count();
+      if (++mergeSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] mergeInstancesIntoBlas ", mergeTotal / 120.0, " ms/frame (mean of 120)"));
+        mergeTotal = 0.0;
+      }
+    }
 
     // Call on the other managers to prepare their GPU data for the current scene
-    m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
-    m_lightManager.prepareSceneData(ctx, m_cameraManager);
+    // Timed: prepareSceneData dominates a frame that is CPU bound, and the
+    // acceleration structure work is the largest thing inside it.
+    {
+      static double accelTotal = 0.0;
+      static uint32_t accelSamples = 0;
+      const auto accelStart = std::chrono::steady_clock::now();
+      m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
+      accelTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - accelStart).count();
+      if (++accelSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] accelManager.prepareSceneData ", accelTotal / 120.0,
+          " ms/frame (mean of 120), instances ", m_instanceManager.getActiveCount()));
+        accelTotal = 0.0;
+      }
+    }
+    {
+      static double lmTotal = 0.0;
+      static uint32_t lmSamples = 0;
+      const auto lmStart = std::chrono::steady_clock::now();
+      m_lightManager.prepareSceneData(ctx, m_cameraManager);
+      lmTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - lmStart).count();
+      if (++lmSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] lightManager ", lmTotal / 120.0, " ms/frame (mean of 120)"));
+        lmTotal = 0.0;
+      }
+    }
 
     // Upload surface material buffer BEFORE the GPU culling dispatch so the
     // compute shader can copy template material entries to per-instance slots.
@@ -2349,8 +2558,10 @@ namespace dxvk {
     const bool updateSurfaceMaterials =
       !m_accelManager.wasSceneUnchangedThisFrame() ||
       TerrainBaker::needsTerrainBaking() ||
+      m_externalMaterialsDirty ||
       startInMediumStateChanged;
     if (updateSurfaceMaterials) {
+      m_hasNativeRefraction = false;
       DxvkBufferCreateInfo matInfo;
       matInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
         | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
@@ -2376,7 +2587,18 @@ namespace dxvk {
 
         std::size_t dataOffset = 0;
         uint32_t surfaceIndex = 0;
-        std::vector<unsigned char> surfaceMaterialsGPUData(surfaceMaterialsGPUSize);
+        // Persistent: this was a fresh zero-initialised allocation of about 1.5 MB
+        // every frame, and its contents are almost entirely the same each time.
+        auto& surfaceMaterialsGPUData = m_surfaceMaterialsGPUData;
+        surfaceMaterialsGPUData.resize(surfaceMaterialsGPUSize);
+        // Deliberately no "already packed" skip here. It was tried and it broke
+        // animation: a native effect or water material animates by mutating its
+        // parameters in place, behind a material index and a material hash that
+        // both stay the same. writeGPUData reads those live parameters, so
+        // skipping the write because the instance was preserved froze every
+        // animated material while its geometry kept moving. Keeping the staging
+        // buffer across frames rather than reallocating it is free and stays.
+        const auto matStart = std::chrono::steady_clock::now();
         for (auto&& pInstance : m_accelManager.getOrderedInstances()) {
           // For PointInstancer duplicates (entries beyond the template), skip
           // writeGPUData - the GPU culling shader copies the template material.
@@ -2388,6 +2610,8 @@ namespace dxvk {
           } else {
             assert(surf.surfaceMaterialIndex < m_surfaceMaterialCache.getObjectTable().size());
             auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[surf.surfaceMaterialIndex];
+            m_hasNativeRefraction |= surfaceMaterial.getType() == RtSurfaceMaterialType::Opaque &&
+              surfaceMaterial.getOpaqueSurfaceMaterial().hasNativeRefraction();
             surfaceMaterial.writeGPUData(surfaceMaterialsGPUData.data(), dataOffset, surfaceIndex);
           }
           surfaceIndex++;
@@ -2407,7 +2631,19 @@ namespace dxvk {
         assert(surfaceMaterialsGPUData.size() == surfaceMaterialsGPUSize);
         m_lastUploadedStartInMediumMaterialIndexInCache = m_startInMediumMaterialIndex_inCache;
 
+        {
+          static double matTotal = 0.0;
+          static uint32_t matSamples = 0;
+          matTotal += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - matStart).count();
+          if (++matSamples % 120 == 0) {
+            Logger::info(str::format("[CSRemix.CPU] surfaceMaterial writeGPUData loop ", matTotal / 120.0,
+              " ms/frame (mean of 120), surfaces ", surfaceIndex));
+            matTotal = 0.0;
+          }
+        }
         ctx->writeToBuffer(m_surfaceMaterialBuffer, 0, surfaceMaterialsGPUData.size(), surfaceMaterialsGPUData.data());
+        m_externalMaterialsDirty = false;
       }
     } else {
       m_startInMediumMaterialIndex = m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex
@@ -2528,11 +2764,20 @@ namespace dxvk {
       auto& entry = m_retainedExternalDraws[found->second];
       entry.absoluteObjectToWorld = absolute;
       entry.state = std::move(state);
+      entry.cameraType = entry.state.cameraType;
+      entry.hasParticleDesc = entry.state.optionalParticleDesc.has_value();
+      ++entry.revision;
       return;
     }
 
     m_retainedExternalIndex.emplace(handle, m_retainedExternalDraws.size());
-    m_retainedExternalDraws.push_back(RetainedExternalDraw { handle, std::move(state), absolute });
+    RetainedExternalDraw created;
+    created.handle = handle;
+    created.absoluteObjectToWorld = absolute;
+    created.state = std::move(state);
+    created.cameraType = created.state.cameraType;
+    created.hasParticleDesc = created.state.optionalParticleDesc.has_value();
+    m_retainedExternalDraws.push_back(std::move(created));
   }
 
   void SceneManager::setRetainedExternalDrawTransform(uint64_t handle, const Matrix4& objectToWorld) {
@@ -2540,8 +2785,11 @@ namespace dxvk {
     if (found == m_retainedExternalIndex.end()) {
       return;
     }
-    // Only the placement moved; the registered description still stands.
+    // Only the placement moved; the registered description still stands. The
+    // preserve path keeps the transform the instance already has, so a move is
+    // still a change as far as the replay is concerned.
     m_retainedExternalDraws[found->second].absoluteObjectToWorld = objectToWorld;
+    ++m_retainedExternalDraws[found->second].revision;
   }
 
   void SceneManager::removeRetainedExternalDraw(uint64_t handle) {
@@ -2549,8 +2797,13 @@ namespace dxvk {
     if (found == m_retainedExternalIndex.end()) {
       return;
     }
-    // The instance itself is left to age out: it is no longer replayed, so the
-    // ordinary garbage collection that retires unseen instances collects it.
+    // Explicit host removal must retire prims before the next TLAS build,
+    // regardless of the unseen-draw lifetime and anti-culling settings.
+    if (m_retainedExternalDraws[found->second].node != nullptr) {
+      m_retainedExternalDraws[found->second].node->releaseHost();
+      m_retainedExternalDraws[found->second].node = nullptr;
+    }
+
     const size_t index = found->second;
     const size_t last = m_retainedExternalDraws.size() - 1;
     if (index != last) {
@@ -2561,15 +2814,242 @@ namespace dxvk {
     m_retainedExternalIndex.erase(found);
   }
 
+
+  // The preserve counterpart of submitExternalDraw, run straight off the stored
+  // registration. submitExternalDraw has to be handed a copy because it consumes
+  // what it is given -- it moves the instancing transforms out and overwrites the
+  // geometry per submesh -- but preserving touches none of that, and copying an
+  // ExternalDrawState for every retained draw cost 1.4 ms a frame on its own.
+  bool SceneManager::tryPreserveRetainedExternalDraw(const Rc<DxvkContext>& ctx, RetainedExternalDraw& entry,
+                                                     bool preservePathUsable) {
+    if (!entry.preserveEligibleThisFrame || !preservePathUsable) {
+      ++m_preserveMissChanged;
+      return false;
+    }
+
+    if (entry.hasParticleDesc) {
+      ++m_preserveMissParticles;
+      return false;
+    }
+
+    // Only the rebased transform is needed here, for the node's bounding box.
+    // It is deliberately not written back into entry.state.drawCall: a full
+    // submission recomputes it from absoluteObjectToWorld, so the write was
+    // dead, and it reached several hundred bytes into the entry to make it.
+    Matrix4 xform = entry.absoluteObjectToWorld;
+    xform[3].x -= m_retainedSceneOrigin.x;
+    xform[3].y -= m_retainedSceneOrigin.y;
+    xform[3].z -= m_retainedSceneOrigin.z;
+
+    // The node this registration owns. No identity hash, no spatial search, no
+    // map lookup: those exist so Remix can work out which node a D3D9 draw call
+    // belongs to, and a host that registers its nodes already knows. The node is
+    // held alive by hostOwned, and destroying it reports the owning handle back
+    // so the replay drops this pointer before it is next read.
+    if (entry.node == nullptr) {
+      ++m_preserveMissNoNode;
+      return false;
+    }
+    ReplacementInstance* replacementInstance = entry.node;
+
+    // The submesh list still has to be consulted for the bounding boxes and the
+    // expanded-grass test, but it only changes when the registration does.
+    if (entry.cachedSubmeshes == nullptr || entry.cachedForRevision != entry.revision) {
+      entry.cachedSubmeshes = m_pReplacer->accessExternalMesh(entry.state.mesh);
+      entry.cachedForRevision = entry.revision;
+    }
+    const auto& submeshesRef = entry.cachedSubmeshes;
+    if (submeshesRef == nullptr) {
+      return false;
+    }
+    const auto& submeshes = *submeshesRef;
+    if (submeshes.empty()) {
+      return false;
+    }
+    if (replacementInstance == nullptr) {
+      ++m_preserveMissNoInstance;
+      return false;
+    }
+    if (!replacementInstance->dirtyFlags.isClear()) {
+      ++m_preserveMissDirty;
+      const auto& flags = replacementInstance->dirtyFlags;
+      m_preserveMissDirtyTransform += flags.test(ReplacementInstance::DirtyFlag::Transform) ? 1u : 0u;
+      m_preserveMissDirtyVertex += flags.test(ReplacementInstance::DirtyFlag::VertexPosHash) ? 1u : 0u;
+      m_preserveMissDirtyMaterial += flags.test(ReplacementInstance::DirtyFlag::MaterialHash) ? 1u : 0u;
+      m_preserveMissDirtyOther += flags.test(ReplacementInstance::DirtyFlag::Other) ? 1u : 0u;
+      m_preserveMissDirtyParticle += flags.test(ReplacementInstance::DirtyFlag::ParticleSystem) ? 1u : 0u;
+      return false;
+    }
+    if (replacementInstance->prims.size() != submeshes.size()) {
+      ++m_preserveMissPrimCount;
+      return false;
+    }
+
+    for (size_t i = 0; i < submeshes.size(); i++) {
+      const RtInstance* inst = replacementInstance->prims[i].getInstance();
+      if (submeshes[i].nativeGrass) {
+        ++m_preserveMissGrass;
+        return false;
+      }
+      if (inst == nullptr || inst->getBlas() == nullptr || inst->isMarkedForGC()) {
+        ++m_preserveMissPrimState;
+        return false;
+      }
+    }
+
+    // Only reached once every cheaper test has passed. The event handlers the
+    // two preserve calls dispatch to take the draw state, so the fat part of the
+    // entry is touched here and nowhere earlier in the walk.
+    ExternalDrawState& state = entry.state;
+
+    AxisAlignedBoundingBox preservedBBox;
+    for (size_t i = 0; i < submeshes.size(); i++) {
+      RtInstance* inst = replacementInstance->prims[i].getInstance();
+      // steady_clock::now() is QueryPerformanceCounter here. Three of them per
+      // preserved instance, for the ~8.4k instances this loop walks every frame,
+      // cost more than the split they report. Opt in when the split is wanted.
+      if (kMeasurePreserveSplit) {
+        const auto sceneStart = std::chrono::steady_clock::now();
+        preserveInstance(*inst, &state.drawCall);
+        const auto instanceStart = std::chrono::steady_clock::now();
+        m_instanceManager.preserveInstance(*inst, state.drawCall, nullptr);
+        const auto instanceEnd = std::chrono::steady_clock::now();
+        m_preserveSceneNs += std::chrono::duration<double, std::nano>(instanceStart - sceneStart).count();
+        m_preserveInstanceNs += std::chrono::duration<double, std::nano>(instanceEnd - instanceStart).count();
+      } else {
+        preserveInstance(*inst, &state.drawCall);
+        m_instanceManager.preserveInstance(*inst, state.drawCall, nullptr);
+      }
+      ++m_preserveCalls;
+      preservedBBox.unionWith(submeshes[i].boundingBox);
+    }
+    replacementInstance->frameLastSeen = m_device->getCurrentFrameId();
+    if (preservedBBox.isValid()) {
+      replacementInstance->geometryBoundingBox = preservedBBox;
+      replacementInstance->objectToWorld = xform;
+    }
+    ++m_retainedPreservedThisFrame;
+    return true;
+  }
+
   void SceneManager::submitRetainedExternalDraws(const Rc<DxvkContext>& ctx) {
     ScopedCpuProfileZone();
+
+    // The host reports only around 96 of its ~8,300 objects as changed per
+    // frame, but every retained draw is copied and reprocessed here regardless.
+    // This measures what that replay costs on the CS thread, which is the
+    // frame's critical path.
+    struct ReplayTimer {
+      SceneManager& manager;
+      size_t count;
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      ~ReplayTimer() {
+        static double total = 0.0;
+        static uint32_t samples = 0;
+        total += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start).count();
+        if (++samples % 120 == 0) {
+          Logger::info(str::format("[CSRemix.CPU] retained replay ", total / 120.0,
+            " ms/frame (mean of 120) over ", count, " draws; preserved ",
+            manager.m_retainedPreservedThisFrame / 120, "/frame, resubmitted ",
+            manager.m_retainedResubmittedThisFrame / 120, "/frame; misses per frame: changed ",
+            manager.m_preserveMissChanged / 120, " particles ", manager.m_preserveMissParticles / 120,
+            " noSubmeshes ", manager.m_preserveMissNoSubmeshes / 120,
+            " noInstance ", manager.m_preserveMissNoInstance / 120,
+            " dirty ", manager.m_preserveMissDirty / 120,
+            " primCount ", manager.m_preserveMissPrimCount / 120,
+            " grass ", manager.m_preserveMissGrass / 120,
+            " primState ", manager.m_preserveMissPrimState / 120,
+            "; dirty bits: transform ", manager.m_preserveMissDirtyTransform / 120,
+            " vertex ", manager.m_preserveMissDirtyVertex / 120,
+            " material ", manager.m_preserveMissDirtyMaterial / 120,
+            " other ", manager.m_preserveMissDirtyOther / 120,
+            " particle ", manager.m_preserveMissDirtyParticle / 120,
+            "; noNode ", manager.m_preserveMissNoNode / 120,
+            " | instance-set draws ", manager.m_instanceSetDrawsThisFrame,
+            ", largest origin motion that would have been reported ",
+            manager.m_instanceSetSpuriousMotion,
+            " | preserve split: SceneManager ", manager.m_preserveSceneNs / 1e6 / 120.0,
+            " ms/frame, InstanceManager ", manager.m_preserveInstanceNs / 1e6 / 120.0,
+            " ms/frame over ", manager.m_preserveCalls / 120, " calls/frame"));
+        manager.m_preserveSceneNs = manager.m_preserveInstanceNs = 0.0;
+        manager.m_preserveCalls = 0;
+        manager.m_instanceSetDrawsThisFrame = 0;
+        manager.m_instanceSetSpuriousMotion = 0.f;
+          manager.m_preserveMissNoNode = 0;
+          manager.m_preserveMissDirtyTransform = manager.m_preserveMissDirtyVertex = 0;
+          manager.m_preserveMissDirtyMaterial = manager.m_preserveMissDirtyOther = 0;
+          manager.m_preserveMissDirtyParticle = 0;
+          manager.m_preserveMissChanged = manager.m_preserveMissParticles = 0;
+          manager.m_preserveMissNoSubmeshes = manager.m_preserveMissNoInstance = 0;
+          manager.m_preserveMissDirty = manager.m_preserveMissPrimCount = 0;
+          manager.m_preserveMissGrass = manager.m_preserveMissPrimState = 0;
+          total = 0.0;
+          manager.m_retainedPreservedThisFrame = 0;
+          manager.m_retainedResubmittedThisFrame = 0;
+        }
+      }
+    } replayTimer { *this, m_retainedExternalDraws.size() };
+
+    // How far the rebasing origin moved since the last replay. Preserved draws
+    // are translated by it rather than resubmitted: the camera moves every
+    // frame, and resubmitting the whole scene because of that was what made
+    // moving the camera cost several times what standing still cost.
+    const Vector3 originDelta = m_retainedReplayHasRun
+      ? Vector3 { m_retainedSceneOrigin.x - m_retainedSceneOriginLastReplay.x,
+                  m_retainedSceneOrigin.y - m_retainedSceneOriginLastReplay.y,
+                  m_retainedSceneOrigin.z - m_retainedSceneOriginLastReplay.z }
+      : Vector3 { 0.f, 0.f, 0.f };
+    m_retainedSceneOriginLastReplay = m_retainedSceneOrigin;
+    m_retainedReplayHasRun = true;
+
+    // Move the whole scene -- every instance and every camera's history -- into
+    // this frame's origin before any of this frame's draws are looked at. After
+    // this the origin may as well not have moved: preserved draws stay still,
+    // resubmitted ones compare against a history in their own coordinates, and
+    // nothing reports motion it does not have.
+    if (originDelta.x != 0.f || originDelta.y != 0.f || originDelta.z != 0.f) {
+      // Only the instances these registrations own: they are the ones whose
+      // transforms this replay derives from an absolute transform and the
+      // origin. Anything else the host submits -- the sky dome, the view model,
+      // the native render's own draws -- is in a space of its own and must not
+      // be moved with the world.
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      for (auto& entry : m_retainedExternalDraws) {
+        if (entry.node == nullptr) {
+          continue;
+        }
+        for (auto& prim : entry.node->prims) {
+          RtInstance* inst = prim.getInstance();
+          // An instance already submitted this frame was described in the new
+          // origin to begin with.
+          if (inst != nullptr && inst->getFrameLastUpdated() != frameId) {
+            inst->rebaseBy(originDelta);
+          }
+        }
+      }
+      m_cameraManager.rebasePreviousFrames(originDelta, frameId);
+    }
+
+    // Both of these are RtxOption reads, which take a global mutex, and the loop
+    // below runs them once per retained draw -- over eight thousand times a
+    // frame. Neither can change while the replay runs.
+    const bool preservePathUsable =
+      RtxOptions::enablePreservePath() && !RtxOptionManager::isDrawcallTranslationInvalid();
 
     for (auto& entry : m_retainedExternalDraws) {
       // submitExternalDraw consumes the state it is given -- it moves the
       // instancing transforms out and overwrites the geometry per submesh -- so
       // the replay hands it a copy and the registration survives for the next
       // frame.
+      entry.preserveEligibleThisFrame = entry.revision == entry.replayedRevision;
+      entry.replayedRevision = entry.revision;
+      if (tryPreserveRetainedExternalDraw(ctx, entry, preservePathUsable)) {
+        continue;
+      }
+
       auto replay = std::make_unique<ExternalDrawState>(entry.state);
+      replay->retainedHandle = entry.handle;
 
       // Rebasing happens here rather than in the host so that the host can keep
       // registering stable absolute transforms as the camera moves.
@@ -2616,18 +3096,56 @@ namespace dxvk {
     const Vector3 worldPos = xform[3].xyz();
 
     const ReplacementInstance::LookupKey externalKey { identityHash, spatialMapHash, matHash, kEmptyHash, worldPos, xform };
-    ReplacementInstance* replacementInstance = m_drawCallTracker.findOrCreateReplacementInstance(externalKey);
+    ReplacementInstance* replacementInstance = nullptr;
+    if (state.retainedHandle) {
+      const auto owner = m_retainedExternalIndex.find(state.retainedHandle);
+      if (owner == m_retainedExternalIndex.end()) {
+        return;
+      }
+      auto& entry = m_retainedExternalDraws[owner->second];
+      entry.node = m_drawCallTracker.trackRetainedDraw(externalKey, state.retainedHandle,
+          m_device->getCurrentFrameId(), entry.node);
+      replacementInstance = entry.node;
+    } else {
+      replacementInstance = m_drawCallTracker.findOrCreateReplacementInstance(externalKey);
+    }
+
     replacementInstance->dirtyFlags.clr(ReplacementInstance::kDynamicFeatureMask);
+    ++m_retainedResubmittedThisFrame;
 
     AxisAlignedBoundingBox geometryBBox;
+
+    // Placements live in absolute coordinates for both instance-set kinds, so
+    // the object transform carries only the rebasing. See the history fix below.
+    const bool isInstanceSetDraw = state.nativeInstanceSet != nullptr ||
+      (state.drawCall.getTransformData().instancesToObject != nullptr &&
+       !state.drawCall.getTransformData().instancesToObject->empty());
 
     for (size_t i = 0; i < submeshes.size(); i++) {
       // submeshes[i] is an element of the vector owned by submeshesRef, not separately
       // allocated. The aliasing ctor shares submeshesRef's ref-count while pointing at
       // the element, keeping the vector alive if destroyExternalMesh erases the entry
       // while a BlasEntry still holds this pointer.
-      state.drawCall.overrideGeometryData(
-        std::shared_ptr<const RasterGeometry>(submeshesRef, &submeshes[i]));
+      if (submeshes[i].nativeGrass) {
+        // Deformation rewrites the geometry, so grass needs a copy of its own
+        // rather than the shared submesh every other draw points straight at.
+        auto deformed = std::make_shared<RasterGeometry>(submeshes[i]);
+        if (!state.hasNativeGrassWind || !state.nativeInstanceSet ||
+            !m_device->getCommon()->metaGeometryUtils().deformNativeGrass(ctx, *deformed,
+              *state.nativeInstanceSet, state.nativeGrassWind)) {
+          ONCE(Logger::err("[CSRemix] native grass deformation input rejected"));
+          continue;
+        }
+        state.drawCall.overrideGeometryData(std::move(deformed));
+        // The expanded vertices already carry the absolute placement. The outer
+        // object transform still performs the camera-origin rebasing.
+        state.drawCall.modifyTransformData().instancesToObject.reset();
+        // Brightness now rides in each vertex's RGB, so the batch stays white.
+        state.drawCall.modifyMaterialData().tFactor = 0xffffffff;
+      } else {
+        state.drawCall.overrideGeometryData(
+          std::shared_ptr<const RasterGeometry>(submeshesRef, &submeshes[i]));
+      }
       state.drawCall.overrideCullMode(state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
 
       const MaterialData* material = m_pReplacer->accessExternalMaterial(submeshes[i].externalMaterial);
@@ -2642,6 +3160,33 @@ namespace dxvk {
 
       RtInstance* existingInstance = (replacementInstance->prims.size() > i)
           ? replacementInstance->prims[i].getInstance() : nullptr;
+
+      // An instance-set draw keeps its placements in absolute coordinates -- in
+      // the expanded vertices for native grass, in instancesToObject otherwise --
+      // so its outer object transform is nothing but the camera-origin rebasing.
+      // The theory was that this makes prevObjectToWorld lag by the origin delta
+      // on every frame the camera moves, reporting the camera's own motion as
+      // world motion on all 54,000 placements, and that this is the shimmer.
+      //
+      // Measured, and it is not. The guard below records what would have been
+      // reported and then writes the new translation through. Across 120 frames
+      // spanning a 60-second camera orbit, with the origin confirmed to follow
+      // the camera over some 4,000 units, the largest value was 0 on every
+      // sample: the existing instance already carries this frame's translation
+      // by the time it is reached. So this path does not report spurious motion,
+      // the assignment is a no-op kept only as a guard, and whatever causes the
+      // shimmer under a moving camera is still unaccounted for.
+      if (existingInstance != nullptr && isInstanceSetDraw) {
+        const Vector4& current = state.drawCall.getTransformData().objectToWorld[3];
+        Vector4& previous = existingInstance->surface.objectToWorld[3];
+        m_instanceSetSpuriousMotion = std::max(m_instanceSetSpuriousMotion,
+          std::max(std::abs(previous.x - current.x),
+            std::max(std::abs(previous.y - current.y), std::abs(previous.z - current.z))));
+        ++m_instanceSetDrawsThisFrame;
+        previous.x = current.x;
+        previous.y = current.y;
+        previous.z = current.z;
+      }
 
       static MaterialData defaultMaterialData(LegacyMaterialData::createDefault());
       auto& materialData = material != nullptr ? *material : defaultMaterialData;
@@ -2697,6 +3242,15 @@ namespace dxvk {
       // DXVK doesnt free chunks for us by default (its high water mark), so hand the geometry,
       // BLAS, OMM and buffer-cache memory freed above back to the system.
       m_device->getCommon()->memoryManager().freeUnusedChunks();
+    }
+  }
+
+  void SceneManager::invalidateExternalMesh(remixapi_MeshHandle handle) {
+    for (auto& entry : m_retainedExternalDraws) {
+      if (entry.state.mesh == handle) {
+        ++entry.revision;
+        entry.cachedSubmeshes.reset();
+      }
     }
   }
 

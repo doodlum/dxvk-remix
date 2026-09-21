@@ -109,6 +109,12 @@ namespace dxvk {
     clear();
   }
 
+  void ReplacementInstance::releaseHost() {
+    hostOwned = false;
+    hostRetainedHandle = 0;
+    clear();
+  }
+
   void ReplacementInstance::clear() {
     // Mark all prim entities for GC and detach their back-pointers, then drop
     // the prim/root slots, the active-replacements tracking pointer, and the

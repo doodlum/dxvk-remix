@@ -107,7 +107,16 @@ struct SssArgs {
   uint enableDiffusionProfile;
   float diffusionProfileScale;
   u16vec2 diffusionProfileDebuggingPixel;
+  // NV-DXVK start: Native foliage evaluates its SSS textures in the shader.
+  uint enableTextureMaps;
+  uint3 textureControlPadding;
+  // NV-DXVK end
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(SssArgs) == 32);
+static_assert(offsetof(SssArgs, enableTextureMaps) == 16);
+#endif
 
 struct EyeArgs {
   uint  enableEyes;

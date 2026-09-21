@@ -32,6 +32,21 @@
 // Note: These material ranges and defaults should be kept in sync with the MDL ranges to prevent mismatching between how data is clamped.
 
 namespace dxvk {
+struct NativeFoliageMaterialData {
+  TextureRef softLight;
+  TextureRef backLight;
+  uint32_t flags = 0;
+  // Rolloff, brightness, complex threshold, colour gamma, diffuse scale, grass SSS amount.
+  std::array<float, 6> parameters {};
+  XXH64_hash_t hash() const {
+    auto h = XXH64(parameters.data(), sizeof(parameters), flags);
+    for (const auto* texture : { &softLight, &backLight }) {
+      const auto v = texture->getImageHash();
+      h = XXH64(&v, sizeof(v), h);
+    }
+    return h;
+  }
+};
 struct NativeEffectMaterialData {
   uint64_t identity = 0;
   TextureRef palette;
@@ -285,6 +300,7 @@ struct name##Data {                                                             
     X_PARAMS(WRITE_PARAMETER_MERGE)                                                                  \
     if (!m_nativeEffect) m_nativeEffect = input.m_nativeEffect;                                       \
     if (!m_nativeLandscape) m_nativeLandscape = input.m_nativeLandscape;                              \
+    if (!m_nativeFoliage) m_nativeFoliage = input.m_nativeFoliage;                                      \
     if (!m_nativeWater) m_nativeWater = input.m_nativeWater;                                          \
     updateCachedHash();                                                                              \
   }                                                                                                  \
@@ -318,6 +334,12 @@ struct name##Data {                                                             
   const bool getNativeSrgbAlbedo() const {                                                           \
     return m_nativeSrgbAlbedo;                                                                       \
   }                                                                                                  \
+  void setNativeRgbNormal(bool value) { m_nativeRgbNormal = value; updateCachedHash(); }              \
+  bool getNativeRgbNormal() const { return m_nativeRgbNormal; }                                       \
+  void setNativeFoliage(std::shared_ptr<const NativeFoliageMaterialData> value) {                      \
+    m_nativeFoliage = std::move(value); updateCachedHash();                                            \
+  }                                                                                                \
+  const auto& getNativeFoliage() const { return m_nativeFoliage; }                                    \
   void setNativeEffect(std::shared_ptr<const NativeEffectMaterialData> value) {                       \
     m_nativeEffect = std::move(value); updateCachedHash();                                            \
   }                                                                                                \
@@ -352,6 +374,8 @@ private:                                                                        
     XXH64_hash_t h = 0;                                                                              \
     X_TEXTURES(WRITE_TEXTURE_HASH)                                                                   \
     X_CONSTANTS(WRITE_CONSTANT_HASH)                                                                 \
+    if (m_nativeRgbNormal) { const uint32_t v = 1; h = XXH64(&v, sizeof(v), h); }                       \
+    if (m_nativeFoliage) { const auto v = m_nativeFoliage->hash(); h = XXH64(&v, sizeof(v), h); }        \
     if (m_nativeEffect) { const auto v = m_nativeEffect->identity; h = XXH64(&v, sizeof(v), h); }        \
     if (m_nativeLandscape) { const auto v = m_nativeLandscape->hash(); h = XXH64(&v, sizeof(v), h); }    \
     if (m_nativeWater) { const auto v = m_nativeWater->identity; h = XXH64(&v, sizeof(v), h); }          \
@@ -369,6 +393,8 @@ private:                                                                        
   Rc<DxvkSampler> m_samplerOverride = nullptr;                                                       \
   bool m_ignoreAlphaChannelOverride = false;                                                         \
   bool m_nativeSrgbAlbedo = false;                                                                   \
+  bool m_nativeRgbNormal = false;                                                                    \
+  std::shared_ptr<const NativeFoliageMaterialData> m_nativeFoliage;                                   \
   std::shared_ptr<const NativeEffectMaterialData> m_nativeEffect;                                     \
   std::shared_ptr<const NativeLandscapeMaterialData> m_nativeLandscape;                                \
   std::shared_ptr<const NativeWaterMaterialData> m_nativeWater;                                        \

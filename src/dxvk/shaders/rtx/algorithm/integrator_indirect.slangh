@@ -209,6 +209,9 @@ void integratePathVertex(
   IndirectPathTextures indirectPathTextures, RayHitInfo rayHitInfo,
   inout PathState pathState)
 {
+  // NV-DXVK start: Unordered and material resolution consume only this interval.
+  beginResolveSegment(rayHitInfo, pathState);
+  // NV-DXVK end
   const bool separateUnorderedApproximations = pathState.getSeparateUnorderedApproximationsActive();
 
   // Setup resolve state

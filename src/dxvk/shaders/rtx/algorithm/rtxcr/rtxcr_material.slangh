@@ -11,6 +11,7 @@
 #pragma once
 
 #include "rtxcr.slangh"
+#include "rtx/utility/gpu_printing.slangh"
 
 #ifdef MAX_SSS_SAMPLE_COUNT
 #undef MAX_SSS_SAMPLE_COUNT
@@ -41,6 +42,40 @@ SssDiffusionProfileResult createEmptySssDiffusionProfileResult()
   return sssDiffusionProfileResult;
 }
 
+// NV-DXVK start: Evaluate the diffusion profile at the traced surface distance.
+vec3 evalSssRadialDensity(const vec3 inverseLength, const float radius)
+{
+  return 0.25f * inverseLength * (exp(-radius * inverseLength) + exp(-radius * inverseLength / 3.0f));
+}
+
+vec3 evalSssSurfaceWeight(const RTXCR_SubsurfaceMaterialData material, const vec3 delta,
+  const vec3 hitNormal, const vec3 normalAxis, const vec3 viewAxis, const bool correctTransmission)
+{
+  const RTXCR_SubsurfaceMaterialCoefficients coefficients = RTXCR_ComputeSubsurfaceMaterialCoefficients(material);
+  const vec3 inverseLength = coefficients.sigma_t * RTXCR_S(coefficients.albedo);
+  const vec3 channelProbability = coefficients.albedo / max(dot(coefficients.albedo, vec3(1.0f)), 1e-7f);
+  const float radiusEpsilon = 1e-6f * cb.metersToWorldUnitScale;
+  const float radius = max(length(delta), radiusEpsilon);
+  const float normalRadius = max(length(delta - dot(delta, normalAxis) * normalAxis), radiusEpsilon);
+  const float viewRadius = max(length(delta - dot(delta, viewAxis) * viewAxis), radiusEpsilon);
+
+  // Two equally likely projection axes; disk-to-surface Jacobians use geometry normals.
+  // The common 1/(2*pi) factor cancels between the radial profile and area PDF.
+  const float normalPdf = dot(channelProbability, evalSssRadialDensity(inverseLength, normalRadius)) /
+    normalRadius * abs(dot(hitNormal, normalAxis));
+  const float viewPdf = dot(channelProbability, evalSssRadialDensity(inverseLength, viewRadius)) /
+    viewRadius * abs(dot(hitNormal, viewAxis));
+  const float surfacePdf = 0.5f * (normalPdf + viewPdf);
+  vec3 radialProfile = coefficients.albedo * evalSssRadialDensity(inverseLength, radius);
+  if (correctTransmission)
+  {
+    radialProfile -= 0.266f * coefficients.ssAlbedo * coefficients.sigma_t *
+      (exp(-5.434f * coefficients.sigma_t * radius) + exp(-1.811f * coefficients.sigma_t * radius));
+  }
+  return surfacePdf > 1e-20f ? max(radialProfile, vec3(0.0f)) / (radius * surfacePdf) : vec3(0.0f);
+}
+// NV-DXVK end
+
 SssTracingResult traceSssRay(
   const Ray sssSampleRay,
   const uint8_t rayMask,
@@ -61,6 +96,17 @@ SssTracingResult traceSssRay(
   // Construct hit info from the hit
   RAY_HIT_INFO_CREATE_RAY_QUERY_COMMITTED(rayHitInfo, rayQuery)
 
+  // NV-DXVK start: Resolve only valid SSS hits.
+  SssTracingResult sssTracingResult = (SssTracingResult)0;
+  sssTracingResult.hasHit = rayHitInfo.hasHit;
+  sssTracingResult.hitDistance = sssTracingResult.hasHit ? rayHitInfo.hitDistance : -1.0f;
+  sssTracingResult.subsurfaceMaterialIndex = SURFACE_INDEX_INVALID;
+  if (!sssTracingResult.hasHit)
+  {
+    return sssTracingResult;
+  }
+  // NV-DXVK end
+
   // Resolve normal and TexCoord
   RayInteraction sssRayInteraction = rayInteractionCreate(sssSampleRay, rayHitInfo);
   Surface sssSampleSurface = surfaces[sssRayInteraction.surfaceIndex];
@@ -68,18 +114,21 @@ SssTracingResult traceSssRay(
     surfaceInteractionCreate<SurfaceGenerateTangents>(sssSampleSurface, sssRayInteraction, sssSampleRay);
 
   const OpaqueSurfaceMaterial sssOpaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(surfaceMaterials[sssRayInteraction.surfaceIndex]);
+  // NV-DXVK start: Evaluate authored skin normals at the diffusion sample.
+  const OpaqueSurfaceMaterialInteraction materialInteraction =
+    opaqueSurfaceMaterialInteractionCreate(sssOpaqueSurfaceMaterial, sssSampleSurface, surfaceInteraction, sssRayInteraction);
 
   // Construct sss tracing result
-  SssTracingResult sssTracingResult;
-  sssTracingResult.hasHit = rayHitInfo.hasHit;
-  sssTracingResult.hitDistance = sssTracingResult.hasHit ? rayHitInfo.hitDistance : -1.0f;
-  sssTracingResult.subsurfaceMaterialIndex = sssTracingResult.hasHit ? sssOpaqueSurfaceMaterial.subsurfaceMaterialIndex : SURFACE_INDEX_INVALID;
+  sssTracingResult.subsurfaceMaterialIndex = sssOpaqueSurfaceMaterial.subsurfaceMaterialIndex;
   sssTracingResult.sssMinimalSurfaceInteraction.position = surfaceInteraction.position;
   sssTracingResult.sssMinimalSurfaceInteraction.positionError = surfaceInteraction.positionError;
   sssTracingResult.sssMinimalSurfaceInteraction.geometryNormal = surfaceInteraction.geometryNormal;
   sssTracingResult.sssMinimalSurfaceInteraction.geometryTangent = surfaceInteraction.geometryTangent;
   sssTracingResult.sssMinimalSurfaceInteraction.geometryBitangent = surfaceInteraction.geometryBitangent;
-  sssTracingResult.normal = surfaceInteraction.geometryNormal;
+  // Geometric normals protect ray offsets; the diffusion lighting lobe uses
+  // the authored shading normal, including the animated model-space basis.
+  sssTracingResult.normal = materialInteraction.shadingNormal;
+  // NV-DXVK end
   sssTracingResult.textureCoordinates = surfaceInteraction.textureCoordinates;
 
   return sssTracingResult;
@@ -112,7 +161,12 @@ SssDiffusionProfileResult evalSssDiffusionProfile(
   subsurfaceMaterialData.scatteringColor = float3(subsurfaceMaterial.singleScatteringAlbedo);
   // For diffusion-profile materials, measurementDistance is a reused field containing the radius scale,
   // rather than a physical measurement distance; increasing it produces deeper subsurface scattering.
-  subsurfaceMaterialData.scale = subsurfaceMaterial.measurementDistance * cb.sssArgs.diffusionProfileScale;
+  // NV-DXVK start: RTXCR coefficients must use the traced geometry's distance unit.
+  // RTXCR's internal 0.01 factor expresses authored radii in meters. Scaling
+  // here gives inverse-world-unit coefficients for both diffusion and transmission.
+  subsurfaceMaterialData.scale = subsurfaceMaterial.measurementDistance *
+    cb.sssArgs.diffusionProfileScale * cb.metersToWorldUnitScale;
+  // NV-DXVK end
   subsurfaceMaterialData.g = subsurfaceMaterial.volumetricAnisotropy;
 
   const float maxSampleRadius = float(subsurfaceMaterial.maxSampleRadius) * cb.metersToWorldUnitScale;
@@ -122,8 +176,13 @@ SssDiffusionProfileResult evalSssDiffusionProfile(
   const float rand = getNextSampleBlueNoise(randomState);
   const vec3 diskNormalWorldSpace = (rand <= 0.5f) ? opaqueSurfaceMaterialInteraction.shadingNormal : minimalRayInteraction.viewDirection;
 
+  // NV-DXVK start: The sampled disk frame must match its selected projection axis.
+  vec3 diskTangent;
+  vec3 diskBitangent;
+  calcOrthonormalBasis(diskNormalWorldSpace, diskTangent, diskBitangent);
   RTXCR_SubsurfaceInteraction subsurfaceInteraction =
-    RTXCR_CreateSubsurfaceInteraction(minimalSurfaceInteraction.position, diskNormalWorldSpace, minimalSurfaceInteraction.geometryTangent, minimalSurfaceInteraction.geometryBitangent);
+    RTXCR_CreateSubsurfaceInteraction(minimalSurfaceInteraction.position, diskNormalWorldSpace, diskTangent, diskBitangent);
+  // NV-DXVK end
 
   uint16_t validSampleCount = 0;
 
@@ -157,6 +216,28 @@ SssDiffusionProfileResult evalSssDiffusionProfile(
     {
       continue;
     }
+
+    // NV-DXVK start: A shared skin material does not imply a nearby scattering point.
+    const vec3 sampleDelta = sssTracingResult.sssMinimalSurfaceInteraction.position - minimalSurfaceInteraction.position;
+    const float surfaceDistance = length(sampleDelta);
+    subsurfaceSample.bssrdfWeight = evalSssSurfaceWeight(subsurfaceMaterialData, sampleDelta,
+      sssTracingResult.sssMinimalSurfaceInteraction.geometryNormal,
+      opaqueSurfaceMaterialInteraction.shadingNormal, minimalRayInteraction.viewDirection,
+      cb.enableSssTransmission && cb.enableTransmissionDiffusionProfileCorrection);
+    if (cb.debugView == DEBUG_VIEW_SKIN_DIFFUSION_DISTANCE)
+    {
+      const float projectedDistance = length(sampleDelta - dot(sampleDelta, diskNormalWorldSpace) * diskNormalWorldSpace);
+      GpuPrint::write(u16vec2(pixelCoordinate), vec4(surfaceDistance, projectedDistance,
+        max(subsurfaceSample.bssrdfWeight.r, max(subsurfaceSample.bssrdfWeight.g, subsurfaceSample.bssrdfWeight.b)),
+        dot(sssTracingResult.sssMinimalSurfaceInteraction.geometryNormal, minimalSurfaceInteraction.geometryNormal)));
+      storeInDebugView(pixelCoordinate, vec3(surfaceDistance / maxSampleRadius,
+        projectedDistance / maxSampleRadius, 0.0f));
+    }
+    if (surfaceDistance > maxSampleRadius || all(subsurfaceSample.bssrdfWeight <= 0.0f))
+    {
+      continue;
+    }
+    // NV-DXVK end
 
     /// Sample Light: Get light sample for current SSS sample
 

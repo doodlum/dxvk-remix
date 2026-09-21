@@ -25,6 +25,9 @@
 #include "imgui.h"
 
 #include <chrono>
+#include <atomic>
+#include <mutex>
+#include <vector>
 #define WIN32_LEAN_AND_MEAN 
 #include <windows.h>
 
@@ -92,7 +95,10 @@ namespace dxvk {
      * \param [in] ctx Device context
      * \param [in] surfaceSize Image size, in pixels
      */
-    void render(const Rc<DxvkContext>&  ctx,  VkExtent2D surfaceSize);
+    void render(const Rc<DxvkContext>& ctx, VkExtent2D surfaceSize, bool hostInput = false);
+
+    // Host input ABI: 0 query, 1 virtual key, 2 mouse button, 3 wheel, 4 character, 5 focus.
+    bool queueHostInput(uint32_t type, uint32_t code, float value);
     
     static void AddTexture(const XXH64_hash_t hash, const Rc<DxvkImageView>& imageView, uint32_t textureFeatureFlags);
     static void ReleaseTexture(const XXH64_hash_t hash);
@@ -124,6 +130,17 @@ namespace dxvk {
     }
 
   private:
+    struct HostInput {
+      uint32_t type;
+      uint32_t code;
+      float value;
+    };
+    std::mutex m_hostInputMutex;
+    std::vector<HostInput> m_hostInputQueue;
+    std::atomic<bool> m_hostInputBlocked { false };
+    bool m_hostKeys[256] {};
+    void processHostInput();
+
     enum class ShaderMessageType {
       None,
       Ok,

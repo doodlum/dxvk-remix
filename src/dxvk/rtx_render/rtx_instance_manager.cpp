@@ -156,7 +156,7 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 800, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      static_assert(RtInstanceSize == 816, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -188,6 +188,13 @@ namespace dxvk {
     surface.previousPositionBufferIndex = geo.previousPositionBufferIndex;
     surface.indexBufferIndex    = geo.indexBufferIndex;
     surface.indexStride         = geo.indexBuffer.stride();
+    // Travel with the buffer indices because they describe how those same
+    // buffers are to be read: a basis instead of a normal, vertex normals kept
+    // as authored, blend weights in the words after the vertex colour.
+    surface.modelSpaceNormals     = geo.modelSpaceNormals;
+    surface.nativeTangentFrame    = geo.nativeTangentFrame;
+    surface.useFaceNormals = geo.useFaceNormals;
+    surface.nativeLandscape       = geo.nativeLandscape;
   }
 
   void RtInstance::copyInstanceDataFrom(const RtInstance& src) {
@@ -334,6 +341,23 @@ namespace dxvk {
 
     // See comment in move()
     return memcmp(surface.prevObjectToWorld.data, surface.objectToWorld.data, sizeof(Matrix4)) != 0;
+  }
+
+  void RtInstance::rebaseBy(const Vector3& originDelta) {
+    // Both transforms move together: the object has not moved, the coordinates
+    // it is described in have. Leaving the history where it was would report the
+    // change of origin as motion. Rotation is untouched, so normalObjectToWorld
+    // stays correct and is deliberately not recomputed.
+    surface.objectToWorld[3].x -= originDelta.x;
+    surface.objectToWorld[3].y -= originDelta.y;
+    surface.objectToWorld[3].z -= originDelta.z;
+    surface.prevObjectToWorld[3].x -= originDelta.x;
+    surface.prevObjectToWorld[3].y -= originDelta.y;
+    surface.prevObjectToWorld[3].z -= originDelta.z;
+    onTransformChanged();
+    // A merged BLAS bakes this transform into its geometry, so the merge has to
+    // be told the transform it baked is no longer the one this instance has.
+    m_blasDirty = true;
   }
 
   void RtInstance::setFrameCreated(const uint32_t frameIndex) {
@@ -578,8 +602,9 @@ namespace dxvk {
     }
   }
 
-  void InstanceManager::erasePersistentMapEntries(RtInstance* dying) {
-    auto eraseFromMap = [dying](std::unordered_map<RtInstance*, RtInstance*>& map) {
+  uint32_t InstanceManager::erasePersistentMapEntries(RtInstance* dying) {
+    uint32_t firstMarkedIndex = UINT32_MAX;
+    auto eraseFromMap = [dying, &firstMarkedIndex](std::unordered_map<RtInstance*, RtInstance*>& map) {
       // Fast O(1) check: is the dying instance a key (reference) in the map?
       auto it = map.find(dying);
       if (it != map.end()) {
@@ -587,6 +612,7 @@ namespace dxvk {
         // so it doesn't survive with a dangling m_linkedBlas pointer.
         // (m_isCreatedByRenderer prevents timeout-based GC, so we must mark explicitly.)
         it->second->markForGarbageCollection();
+        firstMarkedIndex = std::min(firstMarkedIndex, it->second->getVectorIdx());
         map.erase(it);
         return;
       }
@@ -601,6 +627,7 @@ namespace dxvk {
     eraseFromMap(m_persistentViewModelInstances);
     eraseFromMap(m_persistentVirtualViewModelInstances);
     eraseFromMap(m_persistentPlayerModelClones);
+    return firstMarkedIndex;
   }
 
 #ifndef NDEBUG
@@ -635,13 +662,15 @@ namespace dxvk {
 
         // If this instance is tracked in a persistent map (as key or value),
         // remove the entry so we don't leave a dangling pointer.
-        erasePersistentMapEntries(pInstance);
+        const uint32_t firstMarkedIndex = erasePersistentMapEntries(pInstance);
 
         // NOTE: pInstance is now the (previously) last element
         std::swap(pInstance, m_instances.back());
         m_instances[i]->m_instanceVectorId = i;
         destroyInstanceAllocation(m_instances.back());
         m_instances.pop_back();
+        // Swap removal can place a dependent clone before its source in the table.
+        i = std::min(i, firstMarkedIndex);
         continue;
       }
       ++i;
@@ -1020,6 +1049,10 @@ namespace dxvk {
     const auto previousInstancesToObject = currentInstance.surface.instancesToObject;
     const size_t previousInstancesToObjectSize = previousInstancesToObject ? previousInstancesToObject->size() : 0;
 
+    const bool hasThinTransmission = materialData->getType() == MaterialDataType::Opaque &&
+      !materialData->getOpaqueMaterialData().getSubsurfaceDiffusionProfile() &&
+      materialData->getOpaqueMaterialData().getSubsurfaceMeasurementDistance() > 0.0f;
+
     currentInstance.m_categoryFlags = drawCall.getCategoryFlags();
     currentInstance.surface.instancesToObject = drawCall.getTransformData().instancesToObject;
     // Carried alongside the placements so the surface can colour each of them
@@ -1266,6 +1299,13 @@ namespace dxvk {
       currentInstance.m_geometryFlags = VK_GEOMETRY_OPAQUE_BIT_KHR;
     }
     
+    if (hasThinTransmission) {
+      // Visibility must evaluate transmission even in opaque micromap regions,
+      // and each primitive may attenuate a ray only once.
+      currentInstance.m_vkInstance.flags |= VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR;
+      currentInstance.m_geometryFlags |= VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
+    }
+
     // Enable backface culling for Portals to avoid additional hits to the back of Portals
     if (currentInstance.m_materialType == MaterialDataType::RayPortal) {
       currentInstance.m_vkInstance.flags &= ~VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
@@ -2087,7 +2127,15 @@ namespace dxvk {
     // intentionally clear bits from the mask (for player-model particles the mask ends up
     // at 0), so re-checking mask on the next frame would skip the very instances that
     // still need their billboards re-populated on the preserve path.
-    if (!(RtxOptions::enableSeparateUnorderedApproximations() &&
+    // See m_unorderedApproximationsEnabled: an RtxOption read takes a global
+    // mutex, and this guard is the first thing every preserved instance touches.
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if (m_unorderedApproximationsFrame != frameId) {
+      m_unorderedApproximationsFrame = frameId;
+      m_unorderedApproximationsEnabled = RtxOptions::enableSeparateUnorderedApproximations();
+    }
+
+    if (!(m_unorderedApproximationsEnabled &&
           (cameraType == CameraType::Main || cameraType == CameraType::ViewModel) &&
           currentInstance.m_isUnordered &&
           !currentInstance.m_isHidden)) {

@@ -107,8 +107,11 @@ void evalNEEPrimary(
 
   const uint sharedSurfaceIndex = (pomOpaqueSurfaceEncountered || isDiffusionProfileSss) ? uint(SharedSurfaceIndex[pixelCoordinate]) : SURFACE_INDEX_INVALID;
 
-  VisibilityResult occludedVisibility;
+  // NV-DXVK start: Diffusion can contribute without a valid surface light sample.
+  VisibilityResult occludedVisibility = (VisibilityResult) 0;
   occludedVisibility.hasOpaqueHit = true;
+  occludedVisibility.blockerSurfaceIndex = SURFACE_INDEX_INVALID;
+  // NV-DXVK end
 
   VisibilityResult visibility = isValidLightSample ?
     traceVisibilityRay<visibilityModeEnablePom | visibilityModeAccurateHitDistance | visibilityModeEnableTranslucentMaterials | visibilityModeEnableSubsurfaceMaterials>(
@@ -122,6 +125,35 @@ void evalNEEPrimary(
     occludedVisibility;
 
   const bool hasNonSssOpaqueHit = visibility.hasOpaqueHit;
+
+  // NV-DXVK start: Primary direct-light diagnostics, before diffusion visibility.
+  if (geometryFlags.primarySelectedIntegrationSurface)
+  {
+    if (cb.debugView == DEBUG_VIEW_DIRECT_VISIBILITY_STATE)
+    {
+      storeInDebugView(pixelCoordinate, !isValidLightSample ? vec3(1, 0, 0) :
+        (visibility.hasOpaqueHit ? vec3(0, 0, 1) : vec3(0, 1, 0)));
+    }
+    else if (cb.debugView == DEBUG_VIEW_DIRECT_BLOCKER_DISTANCE)
+    {
+      vec3 color = vec3(1, 0, 1);
+      if (isValidLightSample)
+      {
+        color = !visibility.hasOpaqueHit ? vec3(0, 1, 0) :
+          (visibility.hitDistance < 0.1f ? vec3(1, 0, 0) :
+          (visibility.hitDistance < 1.0f ? vec3(1, 1, 0) :
+          (visibility.hitDistance < 10.0f ? vec3(0, 1, 1) : vec3(0, 0, 1))));
+      }
+      storeInDebugView(pixelCoordinate, color);
+    }
+    else if (cb.debugView == DEBUG_VIEW_DIRECT_BLOCKER_SURFACE)
+    {
+      storeInDebugView(pixelCoordinate, !isValidLightSample ? vec3(1, 0, 1) :
+        (!visibility.hasOpaqueHit ? vec3(0, 1, 0) :
+        (visibility.blockerSurfaceIndex == sharedSurfaceIndex ? vec3(1, 0, 0) : vec3(0, 0, 1))));
+    }
+  }
+  // NV-DXVK end
 
   SssDiffusionProfileResult sssDiffusionProfileResult = createEmptySssDiffusionProfileResult();
   if (isDiffusionProfileSss)
@@ -156,6 +188,14 @@ void evalNEEPrimary(
   {
     return;
   }
+
+  // NV-DXVK start: Diffusion samples its own lights; an absent surface sample has no other lobes.
+  if (!isValidLightSample)
+  {
+    diffuseLobeRadiance += throughput * vec3(sssDiffusionProfileResult.scatteringWeight);
+    return;
+  }
+  // NV-DXVK end
   
   // Evaluate the material and accumulate throughput and hit distance
 
@@ -423,10 +463,40 @@ void integrateDirectPath(
   {
     OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction = opaqueSurfaceMaterialInteractionCreate(primaryPolymorphicSurfaceMaterialInteraction);
 
+    // NV-DXVK start: Inspect the first distant light independently of RTXDI visibility rejection.
+    if (geometryFlags.primarySelectedIntegrationSurface &&
+        (cb.debugView == DEBUG_VIEW_DISTANT_NORMAL_HEMISPHERES || cb.debugView == DEBUG_VIEW_DISTANT_NORMAL_COSINES))
+    {
+      vec3 color = vec3(1, 0, 1);
+      const LightRangeInfo range = cb.lightRanges[lightTypeDistant];
+      if (range.count)
+      {
+        const DistantLight distant = distantLightCreate(decodePolymorphicLight(lights[range.offset]));
+        const vec3 directionToLight = -distant.direction;
+        const float geometryCosine = dot(primarySurfaceInteraction.geometryNormal, directionToLight);
+        const float shadingCosine = dot(opaqueSurfaceMaterialInteraction.shadingNormal, directionToLight);
+        // Red: geometry rejects a shading-facing light. Blue: the reverse.
+        // Green: both face the light. Yellow: both face away.
+        color = geometryCosine > 0.0f ?
+          (shadingCosine > 0.0f ? vec3(0, 1, 0) : vec3(0, 0, 1)) :
+          (shadingCosine > 0.0f ? vec3(1, 0, 0) : vec3(1, 1, 0));
+        if (cb.debugView == DEBUG_VIEW_DISTANT_NORMAL_COSINES)
+        {
+          color = vec3(geometryCosine * 0.5f + 0.5f, shadingCosine * 0.5f + 0.5f, 0.0f);
+        }
+        GpuPrint::write(pixelCoordinate, vec4(geometryCosine, shadingCosine,
+          dot(primarySurfaceInteraction.geometryNormal, opaqueSurfaceMaterialInteraction.shadingNormal), float(range.count)));
+      }
+      storeInDebugView(pixelCoordinate, color);
+    }
+    // NV-DXVK end
+
     // Select a light for NEE
 
-    LightSample lightSample;
-    float inverseSelectionPdf;
+    // NV-DXVK start: The diffusion-only path still passes these values to evalNEEPrimary.
+    LightSample lightSample = (LightSample) 0;
+    float inverseSelectionPdf = 0.0f;
+    // NV-DXVK end
     bool rtxdiLightSampleValid = false;
     bool risLightSampleValid = false;
     // Note: The Ray Portal index that the NEE light sample should be assumed to be sampled through.
@@ -459,6 +529,13 @@ void integrateDirectPath(
     const bool isDiffusionProfileSss = (cb.sssArgs.enableDiffusionProfile && isSubsurfaceDiffusionProfileMaterial(opaqueSurfaceMaterialInteraction));
 
     // Evaluate NEE
+    // NV-DXVK start: Mark missing surface samples independently of diffusion lighting.
+    if (geometryFlags.primarySelectedIntegrationSurface && !rtxdiLightSampleValid && !risLightSampleValid &&
+        cb.debugView == DEBUG_VIEW_DIRECT_VISIBILITY_STATE)
+    {
+      storeInDebugView(pixelCoordinate, vec3(1, 0, 0));
+    }
+    // NV-DXVK end
     if (rtxdiLightSampleValid || risLightSampleValid || isDiffusionProfileSss)
     {
       bool hasOpaqueHit = false;

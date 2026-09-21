@@ -3,6 +3,9 @@
 #include "../dxgi/dxgi_adapter.h"
 
 #include "../dxvk/dxvk_instance.h"
+// NV-DXVK start: D3D11 Remix filesystem and logging.
+#include "../util/util_filesys.h"
+// NV-DXVK end
 
 #include "d3d11_device.h"
 #include "d3d11_enums.h"
@@ -10,6 +13,17 @@
 
 namespace dxvk {
   Logger Logger::s_instance("d3d11.log");
+
+  // Defined in d3d11_swapchain.cpp; this translation unit does not need its header.
+  void setPresentsInFlight(uint32_t count);
+
+  // Host control over how many presents may be in flight. The Community Shaders
+  // host calls this with 0 at load; without the export it warned and left the
+  // fork's one-frame default, which serialises its scene capture against the
+  // command-stream thread.
+  extern "C" __declspec(dllexport) void __stdcall dxvkSetSyncPresent(uint32_t sync) {
+    setPresentsInFlight(sync ? 1u : 2u);
+  }
 }
   
 extern "C" {
@@ -23,6 +37,17 @@ extern "C" {
           UINT                FeatureLevels,
           ID3D11Device**      ppDevice) {
     InitReturnPtr(ppDevice);
+
+    // NV-DXVK start: Initialize outside DllMain, before creating RTX resources.
+    ONCE(
+      if (!util::RtxFileSys::isInitialized()) {
+        const auto exeDir = std::filesystem::path(env::getExePath()).parent_path();
+        util::RtxFileSys::init(exeDir.string());
+      }
+      Logger::initRtxLog();
+      util::RtxFileSys::print();
+    );
+    // NV-DXVK end
 
     Rc<DxvkAdapter>  dxvkAdapter;
     Rc<DxvkInstance> dxvkInstance;

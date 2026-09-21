@@ -22,6 +22,13 @@
 #pragma once
 
 #include "opaque_surface_material_blending.slangh"
+// NV-DXVK start: Native foliage colour equations.
+#include "rtx/concept/surface_material/native_foliage_math.h"
+// NV-DXVK end
+#include "rtx/pass/post_fx/native_refraction.h"
+#ifdef RAY_TRACING_PRIMARY_RAY
+#include "rtx/utility/gpu_printing.slangh"
+#endif
 
 // Opaque Surface Material Interaction Constants
 
@@ -39,6 +46,18 @@ static const float roughnessThreshold = float(0.001f);
 #define OPAQUE_MATERIAL_USE_BOUNDED_VNDF_SAMPLING 1
 
 // Opaque Surface Material Interaction Helper Functions
+
+vec3 nativeTangentNormalToWorld(SurfaceInteraction surfaceInteraction, vec3 tangentNormal)
+{
+  vec3 normal = safeNormalize(surfaceInteraction.modelNormalX * tangentNormal.x
+    + surfaceInteraction.modelNormalY * tangentNormal.y
+    + surfaceInteraction.modelNormalZ * tangentNormal.z, surfaceInteraction.geometryNormal);
+  if (dot(surfaceInteraction.modelNormalZ, surfaceInteraction.geometryNormal) < 0.f)
+  {
+    normal = -normal;
+  }
+  return normal;
+}
 
 #ifdef OPAQUE_MATERIAL_USE_POM
 // Parallax Occlusion Mapping Helper Functions
@@ -367,9 +386,14 @@ SubsurfaceMaterialInteraction subsurfaceMaterialInteractionCreate(
 
   bool isDiffusionProfile = subsurfaceMaterial.maxSampleRadius > 0.0f;
 
-  bool measurementDistanceLoaded = !isDiffusionProfile ? surfaceMaterialInteractionTextureReadHelper(subsurfaceMaterial.subsurfaceThicknessTextureIndex, samplerIndex, surfaceInteraction, subsurfaceMeasurementDistance) : false;
-  bool transmittanceColorLoaded = surfaceMaterialInteractionTextureReadHelper(subsurfaceMaterial.subsurfaceTransmittanceTextureIndex, samplerIndex, surfaceInteraction, transmittanceColor);
-  bool singleScatteringAlbedoLoaded = surfaceMaterialInteractionTextureReadHelper(subsurfaceMaterial.subsurfaceSingleScatteringAlbedoTextureIndex, samplerIndex, surfaceInteraction, subsurfaceSingleScatteringAlbedo);
+  // NV-DXVK start: Retained texture indices can outlive a live option change.
+  bool measurementDistanceLoaded = cb.sssArgs.enableTextureMaps && !isDiffusionProfile &&
+    surfaceMaterialInteractionTextureReadHelper(subsurfaceMaterial.subsurfaceThicknessTextureIndex, samplerIndex, surfaceInteraction, subsurfaceMeasurementDistance);
+  bool transmittanceColorLoaded = cb.sssArgs.enableTextureMaps &&
+    surfaceMaterialInteractionTextureReadHelper(subsurfaceMaterial.subsurfaceTransmittanceTextureIndex, samplerIndex, surfaceInteraction, transmittanceColor);
+  bool singleScatteringAlbedoLoaded = cb.sssArgs.enableTextureMaps &&
+    surfaceMaterialInteractionTextureReadHelper(subsurfaceMaterial.subsurfaceSingleScatteringAlbedoTextureIndex, samplerIndex, surfaceInteraction, subsurfaceSingleScatteringAlbedo);
+  // NV-DXVK end
 
   SubsurfaceMaterialInteraction subsurfaceMaterialInteraction;
 
@@ -543,11 +567,201 @@ void overrideMaterialInteractionForEye(
 
 // Opaque Surface Material Interaction Functions
 
+vec3 nativeEffectDecodeRadiance(vec3 color, NativeEffectStorage effect)
+{
+  if ((effect.flags & 4096) != 0)
+  {
+    return vec3(nativeEffectRadianceToLinear(color.x), nativeEffectRadianceToLinear(color.y),
+      nativeEffectRadianceToLinear(color.z));
+  }
+  return gammaToLinear(color);
+}
+
+f16vec4 nativeEffectRead(OpaqueSurfaceMaterial material, Surface surface, SurfaceInteraction interaction, MinimalRayInteraction ray) {
+  const NativeEffectStorage effect = reinterpret<NativeEffectStorage>(material);
+  if ((effect.flags & kNativeRefraction) != 0) {
+    // Screen-space refraction is resolved against the composited RTX scene.
+    return f16vec4(0);
+  }
+  interaction.textureCoordinates = interaction.textureCoordinates * effect.uvScale + effect.uvOffset;
+  interaction.textureGradientX *= effect.uvScale;
+  interaction.textureGradientY *= effect.uvScale;
+  vec4 sample = vec4(1);
+  surfaceMaterialInteractionTextureReadHelper(material.albedoOpacityTextureIndex, material.samplerIndex, interaction, sample);
+  // Palette coordinates are authored scalar channels, not linear-light color.
+  if ((effect.flags & 1) != 0) {
+    const float3 c = float3(sample.rgb);
+    sample.rgb = f16vec3(select(c <= 0.0031308f, 12.92f * c, 1.055f * pow(max(c, 0.f), 1.f / 2.4f) - 0.055f));
+  }
+  f16vec4 tint = material.albedoOpacityConstant;
+  if ((effect.flags & 16) != 0) tint.rgb *= interaction.vertexColor.rgb;
+  if ((effect.flags & 32) != 0) tint.a *= interaction.vertexColor.a;
+  float falloff = interaction.nativeEffectOpacity;
+  if (!surface.isParticle && (effect.flags & 64) != 0) {
+    // Non-layer effects retain their hit-space fallback until their native
+    // vertex path is supported too.
+    falloff = nativeEffectFalloff(dot(float3(interaction.geometryNormal), float3(ray.viewDirection)),
+      effect.falloff.x, effect.falloff.y, effect.falloff.z, effect.falloff.w);
+  }
+  float alpha = float(tint.a) * falloff * interaction.nativeEffectSoftOpacity * effect.propertyAlpha;
+  const bool paletteValid = effect.paletteIndex != BINDING_INDEX_INVALID;
+  if ((effect.flags & 8) != 0 && paletteValid)
+    alpha = float(textures[nonuniformEXT(uint(effect.paletteIndex))].SampleLevel(samplers[nonuniformEXT(uint(effect.paletteSampler))], float2(sample.a, alpha), 0).a);
+  else alpha *= float(sample.a);
+  float3 color;
+  if ((effect.flags & 4) != 0 && paletteValid) {
+    color = float3(textures[nonuniformEXT(uint(effect.paletteIndex))].SampleLevel(samplers[nonuniformEXT(uint(effect.paletteSampler))], float2(sample.g, tint.r), 0).rgb);
+    if ((effect.flags & 2) != 0) color = select(color <= 0.0031308f, 12.92f * color, 1.055f * pow(max(color, 0.f), 1.f / 2.4f) - 0.055f);
+    color *= float(material.emissiveIntensity);
+  } else color = float3(sample.rgb * tint.rgb) * float(material.emissiveIntensity);
+  // The optional flags filter isolates effects from other layers on the ray.
+#ifdef RAY_TRACING_PRIMARY_RAY
+  if (cb.gpuPrintThreadIndex.x != kInvalidThreadIndex &&
+      (cb.debugKnob.x < 0.f || uint(cb.debugKnob.x) == uint(effect.flags)))
+  {
+    float4 probe;
+    const uint phase = cb.debugKnob.y < 0.f ? cb.frameIdx % 8u : min(uint(cb.debugKnob.y), 7u);
+    switch (phase)
+    {
+    case 0: probe = float4(effect.flags, effect.paletteIndex, material.flags, material.emissiveIntensity); break;
+    case 1: probe = sample; break;
+    case 2: probe = float4(color, alpha); break;
+    case 3: probe = float4(effect.uvOffset, effect.uvScale); break;
+    case 4: probe = interaction.vertexColor; break;
+    case 5: probe = float4(tint.a, falloff, effect.propertyAlpha, sample.a); break;
+    default: probe = float4(0); break;
+    }
+    if (phase < 6u)
+    {
+      GpuPrint::write(u16vec2(getDispatchRaysIndex().xy), probe);
+    }
+  }
+#endif
+  // Native engine-light coupling is not yet reproduced by the RTX approximation.
+  return f16vec4(f16vec3(color), float16_t(saturate(alpha)));
+}
+
+// NV-DXVK start: Native grass/tree scattering colour, independent of optical thickness.
+float nativeSoftLightWeight(float rolloff)
+{
+  return nativeSoftLightMultiplier(0.0f, rolloff);
+}
+
+bool nativeGrassCoordinates(OpaqueSurfaceMaterial material, inout SurfaceInteraction interaction)
+{
+  if (!(material.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_FOLIAGE))
+  {
+    return false;
+  }
+  const NativeFoliageStorage foliage = reinterpret<NativeFoliageStorage>(material);
+  if (!(foliage.flags & NATIVE_FOLIAGE_GRASS) || material.albedoOpacityTextureIndex == BINDING_INDEX_INVALID)
+  {
+    return false;
+  }
+  uint width, height;
+  textures[nonuniformEXT(uint(material.albedoOpacityTextureIndex))].GetDimensions(width, height);
+  const vec3 marker = textures[nonuniformEXT(uint(material.albedoOpacityTextureIndex))].Load(int3(0, int(height) - 1, 0)).rgb;
+  const bool complex = abs(length(marker * 2.0f - 1.0f) - 1.0f) < foliage.complexThreshold;
+  if (complex)
+  {
+    interaction.textureCoordinates.y *= 0.5f;
+    interaction.textureGradientX.y *= 0.5f;
+    interaction.textureGradientY.y *= 0.5f;
+  }
+  return complex;
+}
+
+vec3 nativeGrassAlbedo(NativeFoliageStorage foliage, vec3 sampledAlbedo, vec3 vertexColor, bool complexGrass)
+{
+  const vec3 vertex = (foliage.flags & NATIVE_FOLIAGE_NO_VERTEX_COLOR) ? vec3(1.0f) :
+    pow(abs(vertexColor), vec3(foliage.colorGamma));
+  const float vertexAO = max(vertex.r, max(vertex.g, vertex.b));
+  const bool overrideComplex = (foliage.flags & NATIVE_FOLIAGE_OVERRIDE_COMPLEX) != 0;
+  return vec3(
+    nativeGrassAlbedoChannel(sampledAlbedo.r, vertex.r, vertexAO, foliage.colorGamma,
+      foliage.diffuseScale, foliage.brightness, complexGrass, overrideComplex),
+    nativeGrassAlbedoChannel(sampledAlbedo.g, vertex.g, vertexAO, foliage.colorGamma,
+      foliage.diffuseScale, foliage.brightness, complexGrass, overrideComplex),
+    nativeGrassAlbedoChannel(sampledAlbedo.b, vertex.b, vertexAO, foliage.colorGamma,
+      foliage.diffuseScale, foliage.brightness, complexGrass, overrideComplex));
+}
+
+vec3 nativeFoliageLinearColor(NativeFoliageStorage foliage, vec3 color)
+{
+  const bool gammaSpace = (foliage.flags & NATIVE_FOLIAGE_GAMMA_COLOR) != 0;
+  return vec3(nativeFoliageLinearChannel(color.r, gammaSpace),
+    nativeFoliageLinearChannel(color.g, gammaSpace), nativeFoliageLinearChannel(color.b, gammaSpace));
+}
+
+struct NativeFoliageResponse
+{
+  vec3 softColor;
+  vec3 backColor;
+  float rolloff;
+};
+
+NativeFoliageResponse nativeFoliageResponseCreate(OpaqueSurfaceMaterial material, SurfaceInteraction interaction,
+  vec3 sampledAlbedo, bool complexGrass, bool transmissionOnly = false)
+{
+  const NativeFoliageStorage foliage = reinterpret<NativeFoliageStorage>(material);
+  NativeFoliageResponse response = (NativeFoliageResponse)0;
+  vec3 base = pow(abs(sampledAlbedo), vec3(foliage.colorGamma)) * foliage.diffuseScale;
+  if (foliage.flags & NATIVE_FOLIAGE_GRASS)
+  {
+    base = nativeGrassAlbedo(foliage, sampledAlbedo, interaction.vertexColor.rgb, complexGrass);
+    response.rolloff = saturate(interaction.vertexColor.a * 10.0f) * foliage.scatteringAmount * 2.0f;
+    response.softColor = nativeFoliageLinearColor(foliage, base * base);
+    return response;
+  }
+  // Visibility transports light through the authored SSS tint, not reflected diffuse colour.
+  if (transmissionOnly)
+  {
+    base = vec3(1.0f);
+  }
+  vec4 soft = vec4(0.0f), back = vec4(0.0f);
+  if (foliage.flags & NATIVE_FOLIAGE_SOFT)
+  {
+    surfaceMaterialInteractionTextureReadHelper(foliage.softLightTexture, material.samplerIndex, interaction, soft);
+  }
+  if (foliage.flags & NATIVE_FOLIAGE_BACK)
+  {
+    surfaceMaterialInteractionTextureReadHelper(foliage.backLightTexture, material.samplerIndex, interaction, back);
+  }
+  const bool gammaSpace = (foliage.flags & NATIVE_FOLIAGE_GAMMA_COLOR) != 0;
+  response.softColor = vec3(nativeFoliageLightingChannel(base.r, soft.r, gammaSpace),
+    nativeFoliageLightingChannel(base.g, soft.g, gammaSpace), nativeFoliageLightingChannel(base.b, soft.b, gammaSpace));
+  response.backColor = vec3(nativeFoliageLightingChannel(base.r, back.r, gammaSpace),
+    nativeFoliageLightingChannel(base.g, back.g, gammaSpace), nativeFoliageLightingChannel(base.b, back.b, gammaSpace));
+  response.rolloff = max(0.0f, foliage.rolloff);
+  return response;
+}
+
+bool usesNativeFoliageResponse(OpaqueSurfaceMaterialInteraction material)
+{
+  return isThinOpaqueSubsurfaceMaterial(material) &&
+    (material.flags & OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_NATIVE_FOLIAGE);
+}
+
+vec3 nativeFoliageProjectedWeight(OpaqueSurfaceMaterialInteraction material, float angle)
+{
+  const SubsurfaceMaterialInteraction data = material.subsurfaceMaterialInteraction;
+  const vec3 softColor = r11g11b10ToColor(data.packedTransmittanceColor);
+  const vec3 backColor = r11g11b10ToColor(data.packedSingleScatteringAlbedo);
+  const float rolloff = max(0.0f, float(data.measurementDistance) - 1.0f);
+  // CS's response already contains its angular projection. RTX operates in linear radiance.
+  return vec3(
+    nativeFoliageResponseChannel(softColor.r, backColor.r, angle, rolloff),
+    nativeFoliageResponseChannel(softColor.g, backColor.g, angle, rolloff),
+    nativeFoliageResponseChannel(softColor.b, backColor.b, angle, rolloff)) * rcp(pi);
+}
+// NV-DXVK end
+
 OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
   Surface surface,
   inout SurfaceInteraction surfaceInteraction,
-  MinimalRayInteraction minimalRayInteraction)
+  MinimalRayInteraction minimalRayInteraction,
+  bool nativeTransmissionOnly = false)
 {
   OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction;
   // Note: need initialize the flags explicitely to get rid of garbage data.
@@ -599,8 +813,93 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   vec4 metallicSample;
   vec4 emissiveColorSample;
 
-  const bool albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, albedoOpacitySample, materialLodBias);
-  const bool normalLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.normalTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, normalSample, materialLodBias);
+  // A host's effect scrolls its own UVs and resolves colour and alpha through a
+  // palette, so it replaces the ordinary albedo read rather than following it.
+  const bool nativeEffect = (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_EFFECT) != 0;
+  const bool complexGrass = nativeGrassCoordinates(opaqueSurfaceMaterial, surfaceInteraction);
+  const SurfaceInteraction nativeFoliageInteraction = surfaceInteraction;
+  bool albedoOpacityLoaded;
+  if (nativeEffect)
+  {
+    albedoOpacitySample = nativeEffectRead(opaqueSurfaceMaterial, surface, surfaceInteraction, minimalRayInteraction);
+    albedoOpacityLoaded = true;
+  }
+  else
+  {
+    albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, albedoOpacitySample, materialLodBias);
+  }
+  bool normalLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.normalTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, normalSample, materialLodBias);
+
+  // Terrain: blend the layers the host supplied, weighted per vertex. The
+  // weights arrive unnormalised, so they are normalised here, after
+  // interpolation. Each albedo layer is brought into linear space before it is
+  // blended, because the layers do not all agree on whether the hardware
+  // already did it -- blending them in different spaces is what shows as
+  // banding at the seams between ground types.
+  const bool nativeLandscape = surface.nativeLandscape &&
+    (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_LANDSCAPE) != 0;
+  if (nativeLandscape)
+  {
+    float weights[6] = {
+      surfaceInteraction.nativeLandscapeWeights0.x, surfaceInteraction.nativeLandscapeWeights0.y,
+      surfaceInteraction.nativeLandscapeWeights0.z, surfaceInteraction.nativeLandscapeWeights0.w,
+      surfaceInteraction.nativeLandscapeWeights1.x, surfaceInteraction.nativeLandscapeWeights1.y };
+    const float sum = dot(surfaceInteraction.nativeLandscapeWeights0, float4(1.f))
+                    + dot(surfaceInteraction.nativeLandscapeWeights1, float2(1.f));
+
+    // Layer zero is the material's own albedo and normal; the ten carried
+    // indices are the five extra layers of each. A layer whose texture will not
+    // read falls back to the base rather than contributing nothing, so a
+    // missing layer dims the blend instead of punching a black hole in it.
+    const vec4 baseAlbedo = albedoOpacityLoaded ? albedoOpacitySample : opaqueSurfaceMaterial.albedoOpacityConstant;
+    const vec4 baseNormal = normalLoaded ? normalSample : vec4(0.5f, 0.5f, 1.f, 0.f);
+    vec4 blendedAlbedo = 0.f, blendedNormal = 0.f;
+
+    [unroll] for (uint layer = 0; layer < 6; ++layer)
+    {
+      const float weight = sum > 0.f ? weights[layer] / sum : (layer == 0 ? 1.f : 0.f);
+      if (weight <= 0.f)
+      {
+        continue;
+      }
+
+      vec4 diffuse = baseAlbedo, encodedNormal = baseNormal;
+      bool diffuseLoaded = layer == 0 && albedoOpacityLoaded;
+      if (layer != 0)
+      {
+        diffuseLoaded = surfaceMaterialInteractionTextureReadHelper(
+          opaqueSurfaceMaterial.nativeLandscapeTextureIndices[layer - 1],
+          opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, diffuse, materialLodBias);
+        if (!diffuseLoaded)
+        {
+          diffuse = baseAlbedo;
+        }
+        vec4 layerNormal;
+        if (surfaceMaterialInteractionTextureReadHelper(
+              opaqueSurfaceMaterial.nativeLandscapeTextureIndices[5 + layer - 1],
+              opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, layerNormal, materialLodBias))
+        {
+          encodedNormal = layerNormal;
+          normalLoaded = true;
+        }
+      }
+
+      vec3 authored = diffuse.rgb;
+      const uint srgbBit = diffuseLoaded ? layer : 0;
+      if ((opaqueSurfaceMaterial.nativeLandscapeFlags & (1u << srgbBit)) != 0)
+      {
+        // Undo only the hardware sRGB decode, blend in Skyrim's authored space,
+        // and let the common albedo path below perform the single final decode.
+        authored = linearToGamma(authored);
+      }
+      blendedAlbedo += weight * vec4(authored, 1.f);
+      blendedNormal += weight * encodedNormal;
+    }
+
+    albedoOpacitySample = blendedAlbedo;
+    normalSample = blendedNormal;
+    albedoOpacityLoaded = true;
+  }
 
   bool secondNormalLoaded = false;
   if (cb.opaqueMaterialArgs.layeredWaterNormalEnable && surface.isAnimatedWater)
@@ -657,15 +956,8 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   {
     albedo = albedoOpacitySample.rgb;
 
-    // A host may import a texture the game authored in gamma space but stored
-    // in a format that claims linear, so the hardware sampled it without
-    // converting. The alpha channel stays linear in such encodings and is left
-    // alone. albedoScale then trades the darkening this conversion causes back
-    // against the game's own presentation, which never did it.
-    if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_SRGB_ALBEDO)
-    {
-      albedo = gammaToLinear(albedo) * cb.opaqueMaterialArgs.nativeAlbedoScale;
-    }
+    // Native UNORM imports remain in authored space through texture operations.
+    // Their single gamma decode and linear scale are applied below.
 
     // Note: Thin film thickness and opacity deriving their values from the alpha channel are mutually exclusive, set the appropriate
     // one based on the specified flags, and set the opposing variable to a default value (the "default" value must match how the material is decoded from the
@@ -760,7 +1052,26 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Note: Gamma correct albedo input (be it from a constant or a texture). Currently assuming all textures are not using sRGB formats which
   // automatically do this conversion.
   // Todo: Disable this for when a sRGB texture is the source of the albedo.
-  albedo = gammaToLinear(albedo);
+  // NV-DXVK start: Native grass separates vertex AO from albedo and supplies its active colour conversion.
+  const bool nativeGrass = (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_FOLIAGE) &&
+    (reinterpret<NativeFoliageStorage>(opaqueSurfaceMaterial).flags & NATIVE_FOLIAGE_GRASS);
+  if (nativeGrass)
+  {
+    const NativeFoliageStorage foliage = reinterpret<NativeFoliageStorage>(opaqueSurfaceMaterial);
+    albedo = nativeFoliageLinearColor(foliage, nativeGrassAlbedo(foliage,
+      albedoOpacityLoaded ? albedoOpacitySample.rgb : opaqueSurfaceMaterial.albedoOpacityConstant.rgb,
+      nativeFoliageInteraction.vertexColor.rgb, complexGrass));
+  }
+  else
+  {
+    albedo = nativeEffect ? nativeEffectDecodeRadiance(albedo, reinterpret<NativeEffectStorage>(opaqueSurfaceMaterial)) : gammaToLinear(albedo);
+    if (!nativeEffect && albedoOpacityLoaded &&
+        (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_SRGB_ALBEDO))
+    {
+      albedo *= cb.opaqueMaterialArgs.nativeAlbedoScale;
+    }
+  }
+  // NV-DXVK end
   
   // Note: Gamma correct emissive color input (be it from a constant or a texture). Currently assuming all textures are not using sRGB formats which
   // automatically do this conversion.
@@ -768,7 +1079,10 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   emissiveColor = gammaToLinear(emissiveColor);
   
   // Apply material modifiers/overrides
-  albedo = saturate(albedo * cb.opaqueMaterialArgs.albedoScale + cb.opaqueMaterialArgs.albedoBias);
+  // NV-DXVK start: Native grass already resolves the host material's brightness and colour conversion.
+  albedo = nativeGrass ? saturate(albedo) :
+    saturate(albedo * cb.opaqueMaterialArgs.albedoScale + cb.opaqueMaterialArgs.albedoBias);
+  // NV-DXVK end
   
   if (cb.opaqueMaterialArgs.enableThinFilmOverride)
   {
@@ -782,7 +1096,31 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Note: Defaults to 0 as this indicates no normal detail (which should be the case when a normal map is not present).
   float normalDetail = 0.0f;
 
-  if (normalLoaded && surface.modelSpaceNormals)
+  // NV-DXVK start: CS Grass Lighting orients the shading normal by winding, not per-vertex hemisphere tests.
+  const bool nativeGrassNormal = nativeGrass && !surface.useFaceNormals;
+  if (nativeGrassNormal)
+  {
+    const NativeFoliageStorage foliage = reinterpret<NativeFoliageStorage>(opaqueSurfaceMaterial);
+    const bool sphereNormal = (foliage.flags & NATIVE_FOLIAGE_SPHERE_NORMAL) != 0;
+    const bool frontFace = dot(surfaceInteraction.modelNormalX, minimalRayInteraction.viewDirection) >= 0.0f;
+    normal = surfaceInteraction.modelNormalZ * nativeGrassNormalSign(sphereNormal, frontFace);
+    if (complexGrass)
+    {
+      // Diffuse UV/gradients already select the upper half; normals share its footprint in the lower half.
+      SurfaceInteraction normalInteraction = surfaceInteraction;
+      normalInteraction.textureCoordinates.y += 0.5f;
+      vec4 grassNormalSample;
+      if (surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex,
+          opaqueSurfaceMaterial.samplerIndex, normalInteraction, grassNormalSample))
+      {
+        normal = nativeGrassMapNormal(normal, surfaceInteraction.rawTangent, surfaceInteraction.rawBitangent,
+          minimalRayInteraction.viewDirection, grassNormalSample.rgb * 2.0f - 1.0f);
+        normalDetail = 1.0f;
+      }
+    }
+  }
+  // NV-DXVK end
+  else if (normalLoaded && surface.modelSpaceNormals)
   {
     // A normal map imported straight from the host is not in Remix's
     // octahedral encoding: it holds a direction in the model space the mesh
@@ -796,6 +1134,18 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
                      + surfaceInteraction.modelNormalZ * modelNormal.z);
     normalDetail = 1.0f;
   }
+  else if (normalLoaded && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_LANDSCAPE))
+  {
+    // A host's terrain normal layers are ordinary tangent-space RGB maps, not
+    // Remix's octahedral encoding, and they were already blended above.
+    const vec3 terrainTangentNormal = normalize(vec3(normalSample.rgb) * 2.f - 1.f);
+    const f16mat3 terrainTangentToWorld = transpose(worldToTangent);
+
+    normal = surface.nativeTangentFrame
+      ? nativeTangentNormalToWorld(surfaceInteraction, terrainTangentNormal)
+      : normalize(mul(terrainTangentToWorld, terrainTangentNormal));
+    normalDetail = 1.0f;
+  }
   else if (normalLoaded)
   {
     vec3 tangentNormal;
@@ -806,6 +1156,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       // REMIX-2224: Normals blended during terrain baking using programmable shaders can sometimes end up being invalid so we sanitize them at this point
       tangentNormal = sanitize(normalSample.xyz, cb.isZUp ? vec3(0.f, 0.f, 1.f) : vec3(0.f, 1.f, 0.f));
     }
+    else if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_RGB_NORMAL)
+    {
+      // Host RGB normal maps bypass the asset pipeline's octahedral conversion.
+      tangentNormal = safeNormalize(vec3(normalSample.xyz) * 2.f - 1.f, vec3(0.f, 0.f, 1.f));
+    }
     else // Decode encoded normal sample
     {
       // Note: Using f16 from texture to decode from is fine as the original texture is only 8 bits of precision.
@@ -814,7 +1169,14 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     
     const f16mat3 tangentToWorld = transpose(worldToTangent);
 
-    normal = normalize(mul(tangentToWorld, tangentNormal));
+    if (surface.nativeTangentFrame)
+    {
+      normal = nativeTangentNormalToWorld(surfaceInteraction, tangentNormal);
+    }
+    else
+    {
+      normal = normalize(mul(tangentToWorld, tangentNormal));
+    }
 
     // REMIX-2224: Normals blended during terrain baking using programmable shaders can sometimes end up being invalid
     // after being transformed to world space so we sanitize them here
@@ -880,7 +1242,13 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   // Transform to desired Opaque Material Interaction values
 
-  opaqueSurfaceMaterialInteraction.shadingNormal = getBentNormal(surfaceInteraction.geometryNormal, normal, -minimalRayInteraction.viewDirection);
+  // NV-DXVK start: Preserve authored normals only in the BSDF's view-facing hemisphere.
+  const bool nativeModelNormal = normalLoaded && surface.modelSpaceNormals;
+  const bool keepNativeNormal = (nativeGrassNormal || nativeModelNormal) &&
+    dot(normal, minimalRayInteraction.viewDirection) > 0.0f;
+  opaqueSurfaceMaterialInteraction.shadingNormal = keepNativeNormal ? normal :
+    getBentNormal(surfaceInteraction.geometryNormal, normal, -minimalRayInteraction.viewDirection);
+  // NV-DXVK end
   opaqueSurfaceMaterialInteraction.normalDetail = normalDetail;
   // Todo: Shading tangent/bitangent for anisotropy?
   opaqueSurfaceMaterialInteraction.opacity = opacity;
@@ -898,8 +1266,56 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   opaqueSurfaceMaterialInteraction.emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
 
+  // A host's effect composes its own albedo and emissive. Its brightness is
+  // already carried in the colour resolved above, so the generic emissive
+  // assignment double-counts it and clips the flames to white. lightingInfluence
+  // decides how much of the effect is lit rather than emitted.
+  if (nativeEffect)
+  {
+    const NativeEffectStorage effect = reinterpret<NativeEffectStorage>(opaqueSurfaceMaterial);
+    const float lit = (effect.flags & 128) != 0 ? saturate(float(effect.lightingInfluence)) : 0.f;
+    const vec3 authoredColor = nativeEffectDecodeRadiance(albedoOpacitySample.rgb, effect);
+    opaqueSurfaceMaterialInteraction.albedo = albedo * opacity * lit;
+    opaqueSurfaceMaterialInteraction.baseReflectivity = 0.f;
+    const float emissionWeight = surface.isEmissiveBlend ? emissiveBlendOverrideInfluence : opacity;
+    opaqueSurfaceMaterialInteraction.emissiveRadiance =
+      authoredColor * nativeEffectDecodeRadiance(opaqueSurfaceMaterial.emissiveColorConstant, effect) * (1.f - lit) * emissionWeight;
+#ifdef RAY_TRACING_PRIMARY_RAY
+    if (cb.gpuPrintThreadIndex.x != kInvalidThreadIndex &&
+        (cb.debugKnob.x < 0.f || uint(cb.debugKnob.x) == uint(effect.flags)))
+    {
+      const uint phase = cb.debugKnob.y < 0.f ? cb.frameIdx % 8u : min(uint(cb.debugKnob.y), 7u);
+      if (phase == 6u)
+      {
+        GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+          vec4(opaqueSurfaceMaterialInteraction.emissiveRadiance, opaqueSurfaceMaterialInteraction.opacity));
+      }
+      else if (phase == 7u)
+      {
+        GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+          vec4(float(surface.blendType), surface.isParticle ? 1.f : 0.f, surface.isEmissiveBlend ? 1.f : 0.f, emissionWeight));
+      }
+    }
+#endif
+  }
+
   opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction =
     subSurfaceMaterialReadHelper(opaqueSurfaceMaterial.subsurfaceMaterialIndex, surfaceInteraction, opaqueSurfaceMaterial.samplerIndex);
+
+  // NV-DXVK start: Native response payload reuses thin SSS storage without enlarging the G-buffer.
+  if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_FOLIAGE) &&
+      cb.sssArgs.enableThinOpaque && cb.sssArgs.enableTextureMaps)
+  {
+    const NativeFoliageResponse response = nativeFoliageResponseCreate(opaqueSurfaceMaterial,
+      nativeFoliageInteraction, albedoOpacityLoaded ? albedoOpacitySample.rgb : opaqueSurfaceMaterial.albedoOpacityConstant.rgb,
+      complexGrass, nativeTransmissionOnly);
+    opaqueSurfaceMaterialInteraction.flags |= OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_NATIVE_FOLIAGE;
+    opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction.packedTransmittanceColor = colorToR11G11B10(max(response.softColor, vec3(0.0f)));
+    opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction.packedSingleScatteringAlbedo = colorToR11G11B10(max(response.backColor, vec3(0.0f)));
+    // +1 preserves the thin-material sentinel even when authored rolloff is zero.
+    opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction.measurementDistance = float16_t(response.rolloff + 1.0f);
+  }
+  // NV-DXVK end
 
   // For an eye, load a secondary texture (iris) and blend on top of primary texture (whites)
   if (cb.eyeArgs.enableEyes && surface.isEye)
@@ -1235,9 +1651,14 @@ SurfaceMaterialInteractionSample opaqueSurfaceMaterialInteractionCalcDiffuseRefl
     evalHammonDiffuse(opaqueSurfaceMaterialInteraction.albedo, opaqueSurfaceMaterialInteraction.isotropicRoughness,
       inputDirectionDotOutputDirection, normalDotInputDirection,
       normalDotOutputDirection, normalDotMicrofacetNormal) * lambertTransmissionWeight;
-  const vec3 throughput =
+  vec3 throughput =
     saferPositiveDivide(weight, vec3(cosineHemisphereSolidAnglePdf), materialEpsilon, materialMaximum) *
     normalDotInputDirection;
+  if (usesNativeFoliageResponse(opaqueSurfaceMaterialInteraction))
+  {
+    throughput += saferPositiveDivide(nativeFoliageProjectedWeight(opaqueSurfaceMaterialInteraction, normalDotInputDirection),
+      vec3(cosineHemisphereSolidAnglePdf), materialEpsilon, materialMaximum);
+  }
 
   // Return the material sample
 
@@ -1483,6 +1904,17 @@ SurfaceMaterialInteractionSample thinOpaqueSurfaceMaterialInteractionCalcDiffuse
   // Note: Negative as input direction always points into surface
   const float /*-n.l */ transmissionNormalDotInputDirection = -inputDirection.z;
   const float /*-v.l */ inputPropagationDirectionDotOutputDirection = dot(-outputDirection, inputDirection);
+
+  if (usesNativeFoliageResponse(opaqueSurfaceMaterialInteraction))
+  {
+    SurfaceMaterialInteractionSample nativeSample;
+    nativeSample.inputDirection = quaternionTransformVector(tangentToWorldSpaceQuaternion, inputDirection);
+    nativeSample.throughput = saferPositiveDivide(nativeFoliageProjectedWeight(opaqueSurfaceMaterialInteraction, inputDirection.z),
+      vec3(cosineHemisphereSolidAnglePdf), materialEpsilon, materialMaximum);
+    nativeSample.solidAnglePdf = cosineHemisphereSolidAnglePdf;
+    penetrateSurface = true;
+    return nativeSample;
+  }
 
   const vec3 weight = evalHanrahanSingleScatteringDiffuseTransmission(
     opaqueSurfaceMaterialInteraction.baseReflectivity,
@@ -1864,6 +2296,8 @@ SurfaceMaterialInteractionSplitWeight opaqueSurfaceMaterialInteractionCalcApprox
   {
     diffuseTransmissionWeight = subsurfaceMaterial.singleScatteringAlbedo;
   }
+  const bool nativeFoliage = usesNativeFoliageResponse(opaqueSurfaceMaterialInteraction);
+  const vec3 nativeWeight = nativeFoliage ? nativeFoliageProjectedWeight(opaqueSurfaceMaterialInteraction, normalDotInputDirection) : vec3(0.0f);
 
   if (normalDotOutputDirection < 0.0f || normalDotInputDirection < 0.0f)
   {
@@ -1887,7 +2321,7 @@ SurfaceMaterialInteractionSplitWeight opaqueSurfaceMaterialInteractionCalcApprox
     }
     else
     {
-      splitWeight.diffuseTransmissionWeight = diffuseTransmissionWeight * (-normalDotInputDirection);
+      splitWeight.diffuseTransmissionWeight = nativeFoliage ? nativeWeight : diffuseTransmissionWeight * (-normalDotInputDirection);
     }
 
     return splitWeight;
@@ -1903,7 +2337,7 @@ SurfaceMaterialInteractionSplitWeight opaqueSurfaceMaterialInteractionCalcApprox
 
   // Create a split weight
   SurfaceMaterialInteractionSplitWeight splitWeight;
-  splitWeight.diffuseReflectionWeight = diffuseReflectionWeight * normalDotInputDirection;
+  splitWeight.diffuseReflectionWeight = diffuseReflectionWeight * normalDotInputDirection + nativeWeight;
   splitWeight.specularReflectionWeight = specularReflectionWeight * normalDotInputDirection;
   splitWeight.diffuseTransmissionWeight = vec3(0.0, 0.0, 0.0); // Will always be 0 when normalDotInputDirection >= 0
 
@@ -1949,7 +2383,10 @@ SurfaceMaterialInteractionSplitWeight opaqueSurfaceMaterialInteractionCalcProjec
   const bool isThinOpaqueSubsurface = isThinOpaqueSubsurfaceMaterial(opaqueSurfaceMaterialInteraction);
 
   vec3 diffuseTransmissionWeight = vec3(0.0f, 0.0f, 0.0f);
-  if (isThinOpaqueSubsurface && normalDotOutputDirection > 0.0f) {
+  const bool nativeFoliage = usesNativeFoliageResponse(opaqueSurfaceMaterialInteraction);
+  const vec3 nativeWeight = nativeFoliage && normalDotOutputDirection >= 0.0f ?
+    nativeFoliageProjectedWeight(opaqueSurfaceMaterialInteraction, normalDotInputDirection) : vec3(0.0f);
+  if (isThinOpaqueSubsurface && !nativeFoliage && normalDotOutputDirection > 0.0f) {
     diffuseTransmissionWeight = evalHanrahanSingleScatteringDiffuseTransmission(
       opaqueSurfaceMaterialInteraction.baseReflectivity,
       subsurfaceMaterial.volumetricAttenuationCoefficient, subsurfaceMaterial.measurementDistance,
@@ -1965,7 +2402,7 @@ SurfaceMaterialInteractionSplitWeight opaqueSurfaceMaterialInteractionCalcProjec
 
     splitWeight.diffuseReflectionWeight = vec3(0.0, 0.0, 0.0);
     splitWeight.specularReflectionWeight = vec3(0.0, 0.0, 0.0);
-    splitWeight.diffuseTransmissionWeight = diffuseTransmissionWeight * transmissionNormalDotInputDirection;
+    splitWeight.diffuseTransmissionWeight = nativeFoliage ? nativeWeight : diffuseTransmissionWeight * transmissionNormalDotInputDirection;
 
     return splitWeight;
   }
@@ -2016,7 +2453,7 @@ SurfaceMaterialInteractionSplitWeight opaqueSurfaceMaterialInteractionCalcProjec
 
   SurfaceMaterialInteractionSplitWeight splitWeight;
 
-  splitWeight.diffuseReflectionWeight = diffuseReflectionWeight * normalDotInputDirection;
+  splitWeight.diffuseReflectionWeight = diffuseReflectionWeight * normalDotInputDirection + nativeWeight;
   splitWeight.specularReflectionWeight = specularReflectionWeight * normalDotInputDirection;
   splitWeight.diffuseTransmissionWeight = diffuseTransmissionWeight * normalDotInputDirection;
 

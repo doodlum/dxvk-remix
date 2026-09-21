@@ -25,11 +25,14 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx/pass/post_fx/post_fx.h"
+#include "rtx/pass/post_fx/native_refraction.h"
 
 #include <rtx_shaders/post_fx.h>
 #include <rtx_shaders/post_fx_highlight.h>
 #include <rtx_shaders/post_fx_motion_blur.h>
 #include <rtx_shaders/post_fx_motion_blur_prefilter.h>
+#include <rtx_shaders/native_refraction_mask.h>
+#include <rtx_shaders/native_refraction_composite.h>
 #include <pxr/base/arch/math.h>
 #include "rtx_imgui.h"
 
@@ -40,6 +43,30 @@ namespace dxvk {
 
   // Defined within an unnamed namespace to ensure unique definition across binary
   namespace {
+    class NativeRefractionMaskShader : public ManagedShader {
+      SHADER_SOURCE(NativeRefractionMaskShader, VK_SHADER_STAGE_COMPUTE_BIT, native_refraction_mask)
+      BINDLESS_ENABLED()
+      PUSH_CONSTANTS(NativeRefractionArgs)
+      BEGIN_PARAMETER()
+        COMMON_RAYTRACING_BINDINGS
+        TEXTURE2D(NATIVE_REFRACTION_DEPTH)
+        RW_TEXTURE2D(NATIVE_REFRACTION_MASK)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(NativeRefractionMaskShader);
+
+    class NativeRefractionCompositeShader : public ManagedShader {
+      SHADER_SOURCE(NativeRefractionCompositeShader, VK_SHADER_STAGE_COMPUTE_BIT, native_refraction_composite)
+      PUSH_CONSTANTS(NativeRefractionArgs)
+      BEGIN_PARAMETER()
+        TEXTURE2D(NATIVE_REFRACTION_MASK)
+        TEXTURE2D(NATIVE_REFRACTION_COLOR)
+        RW_TEXTURE2D(NATIVE_REFRACTION_OUTPUT)
+        SAMPLER(NATIVE_REFRACTION_SAMPLER)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(NativeRefractionCompositeShader);
+
     class PostFxShader : public ManagedShader
     {
       SHADER_SOURCE(PostFxShader, VK_SHADER_STAGE_COMPUTE_BIT, post_fx)
@@ -255,6 +282,44 @@ namespace dxvk {
 
       return float2(scale.x * chromaticAberrationAmount, scale.y * chromaticAberrationAmount);
     }
+  }
+
+  void DxvkPostFx::dispatchNativeRefraction(Rc<RtxContext> ctx, const Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+    if (!ctx->getSceneManager().hasNativeRefraction()) {
+      return;
+    }
+    ScopedGpuProfileZone(ctx, "Native Refraction");
+    ctx->setFramePassStage(RtxFramePassStage::PostFX);
+    const auto& color = rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite);
+    const auto extent = color.image->info().extent;
+    if (m_nativeRefractionMask.image == nullptr ||
+        m_nativeRefractionMask.image->info().extent.width != extent.width ||
+        m_nativeRefractionMask.image->info().extent.height != extent.height) {
+      Rc<DxvkContext> baseContext = ctx;
+      m_nativeRefractionMask = Resources::createImageResource(baseContext, "Native Refraction Mask",
+        extent, VK_FORMAT_R16G16B16A16_SFLOAT);
+    }
+    const auto groups = util::computeBlockCount(extent, VkExtent3D {16, 8, 1});
+    NativeRefractionArgs args {};
+    args.imageSize = {extent.width, extent.height};
+    args.debugMask = debugMask();
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+    ctx->bindCommonRayTracingResources(rtOutput);
+    ctx->pushConstants(0, sizeof(args), &args);
+    ctx->bindResourceView(NATIVE_REFRACTION_DEPTH, rtOutput.m_primaryLinearViewZ.view, nullptr);
+    ctx->bindResourceView(NATIVE_REFRACTION_MASK, m_nativeRefractionMask.view, nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NativeRefractionMaskShader::getShader());
+    ctx->dispatch(groups.width, groups.height, groups.depth);
+
+    ctx->bindResourceView(NATIVE_REFRACTION_COLOR, color.view, nullptr);
+    ctx->bindResourceView(NATIVE_REFRACTION_OUTPUT, rtOutput.m_postFxIntermediateTexture.view, nullptr);
+    ctx->bindResourceSampler(NATIVE_REFRACTION_SAMPLER, ctx->getResourceManager().getSampler(
+      VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE));
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NativeRefractionCompositeShader::getShader());
+    ctx->dispatch(groups.width, groups.height, groups.depth);
+    ctx->copyImage(color.image, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+      rtOutput.m_postFxIntermediateTexture.image, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, extent);
   }
 
   void DxvkPostFx::dispatchMotionBlur(

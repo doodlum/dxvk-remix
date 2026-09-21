@@ -4330,7 +4330,59 @@ namespace dxvk {
     ImGui::PopItemWidth();
   }
 
-  void ImGUI::render(const Rc<DxvkContext>& ctx, VkExtent2D surfaceSize) {
+  bool ImGUI::queueHostInput(uint32_t type, uint32_t code, float value) {
+    if (type >= 1 && type <= 5) {
+      std::lock_guard<std::mutex> lock(m_hostInputMutex);
+      if (m_hostInputQueue.size() >= 512) {
+        m_hostInputQueue.clear();
+        m_hostInputQueue.push_back({ 5, 0, 0 });
+        m_hostInputQueue.push_back({ 5, 0, 1 });
+      }
+      m_hostInputQueue.push_back({ type, code, value });
+    }
+    return m_hostInputBlocked.load();
+  }
+
+  void ImGUI::processHostInput() {
+    std::vector<HostInput> events;
+    {
+      std::lock_guard<std::mutex> lock(m_hostInputMutex);
+      events.swap(m_hostInputQueue);
+    }
+    auto& io = ImGui::GetIO();
+    for (const auto& event : events) {
+      const bool pressed = event.value > 0;
+      switch (event.type) {
+      case 1:
+        if (event.code < 256) {
+          m_hostKeys[event.code] = pressed;
+          io.AddKeyEvent(ImGuiKey_ModCtrl, m_hostKeys[VK_LCONTROL] || m_hostKeys[VK_RCONTROL]);
+          io.AddKeyEvent(ImGuiKey_ModShift, m_hostKeys[VK_LSHIFT] || m_hostKeys[VK_RSHIFT]);
+          io.AddKeyEvent(ImGuiKey_ModAlt, m_hostKeys[VK_LMENU] || m_hostKeys[VK_RMENU]);
+          const auto key = ImGui_ImplWin32_VirtualKeyToImGuiKey(event.code);
+          if (key != ImGuiKey_None) {
+            io.AddKeyEvent(key, pressed);
+          }
+        }
+        break;
+      case 2:
+        if (event.code < 5) {
+          io.AddMouseButtonEvent(event.code, pressed);
+        }
+        break;
+      case 3: io.AddMouseWheelEvent(0, event.value); break;
+      case 4: io.AddInputCharacter(event.code); break;
+      case 5:
+        io.AddFocusEvent(pressed);
+        if (!pressed) {
+          std::fill(std::begin(m_hostKeys), std::end(m_hostKeys), false);
+        }
+        break;
+      }
+    }
+  }
+
+  void ImGUI::render(const Rc<DxvkContext>& ctx, VkExtent2D surfaceSize, bool hostInput) {
     ScopedGpuProfileZone(ctx, "ImGUI Render");
 
     const HWND gameHwnd = ctx->getCommonObjects()->getLastKnownWindowHandle();
@@ -4340,6 +4392,10 @@ namespace dxvk {
       return;
     }
 
+    // In-process DirectInput hosts supply events without taking over raw-input registration.
+    if (hostInput && !m_init) {
+      m_overlayWin = nullptr;
+    }
     if (m_overlayWin.ptr() != nullptr) {
       m_overlayWin->update(gameHwnd);
     }
@@ -4370,12 +4426,18 @@ namespace dxvk {
     ImGui_ImplDxvk::NewFrame();
     ImGui_ImplWin32_NewFrame(); 
 
+    if (hostInput) {
+      processHostInput();
+    }
+
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float) surfaceSize.width, (float) surfaceSize.height);
 
     ImGui::NewFrame();
 
     update(ctx);
+
+    m_hostInputBlocked.store(RtxOptions::showUI() != UIType::None && RtxOptions::blockInputToGameInUI());
 
     ImGui_ImplDxvk::RenderDrawData(ImGui::GetDrawData(), ctx.ptr(), surfaceSize.width, surfaceSize.height);
   }

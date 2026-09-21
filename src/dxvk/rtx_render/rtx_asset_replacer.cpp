@@ -240,7 +240,14 @@ void AssetReplacer::destroyExternalMaterial(remixapi_MaterialHandle handle) {
   m_extMaterials.erase(handle);
 }
 
-void AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes) {
+void AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes, bool replace) {
+  if (replace) {
+    const auto found = m_extMeshes.find(handle);
+    if (found != m_extMeshes.end()) {
+      found->second = std::make_shared<std::vector<RasterGeometry>>(std::move(submeshes));
+    }
+    return;
+  }
   if (m_extMeshes.count(handle) > 0) {
     Logger::info("Ignoring repeated mesh registration (handle=" + tostr(handle) + ") ");
     return;

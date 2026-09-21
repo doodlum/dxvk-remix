@@ -3,9 +3,18 @@ EXPORTS
     remixapi_InitializeLibrary
     remixapi_dxvk_RegisterD3D11Device
     csRemixCreateGrassInstanceSet
+    csRemixCreateGrassInstanceSetV2
     csRemixCreateInstanceSet
+    csRemixCreateEffectMaterialD3D11V1
+    csRemixCreateLandscapeMaterialD3D11
     csRemixCreateMaterialD3D11V3
+  csRemixCreateMaterialD3D11V4
+  csRemixCreateSkinMaterialD3D11V1
+  csRemixCreateFoliageMaterialD3D11V1
+    csRemixCreateWaterMaterialD3D11V3
     csRemixCreateMeshMSN
+  csRemixCreateMeshTBN
+  csRemixCreateMeshTBNV2
     csRemixCreateMeshNative
     csRemixApplyGraphicsPreset
     csRemixCreateRetainedInstance
@@ -15,10 +24,15 @@ EXPORTS
     csRemixDrawGrassInstanceSet
     csRemixDrawInstanceSet
     csRemixDrawRetainedInstances
+    dxvkSetSyncPresent
     csRemixRender
+    csRemixGuiInput
+    csRemixCaptureBuffers
     csRemixSetSkyDome
     csRemixUpdateRetainedInstance
     csRemixUpdateRetainedInstanceTransform
+    csRemixUpdateEffectMaterialV1
+    csRemixUpdateWaterMaterialV3
     CreateDXGIFactory
     CreateDXGIFactory1
     CreateDXGIFactory2
@@ -28,3 +42,6 @@ EXPORTS
     D3D11CreateDevice @22
     D3D11CreateDeviceAndSwapChain @23
     D3D11On12CreateDevice @24
+    dxvkGetPresenterSurfaceState
+    dxvkRequestSwapchainRecreate
+    dxvkSetSwapchainTornDownCallback

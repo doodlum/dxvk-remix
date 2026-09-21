@@ -378,6 +378,7 @@ void outputToDebugViewAtTheEnd(
     ));
 
     break;
+  case DEBUG_VIEW_PAIRED_MATERIAL_FRAME:
   case DEBUG_VIEW_PRIMARY_SPECULAR_ALBEDO:
     storeInDebugView(pixelCoordinate, aliasedData0.PrimarySpecularAlbedo[pixelCoordinate].xyz);
     break;

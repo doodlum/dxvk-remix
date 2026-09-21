@@ -570,7 +570,7 @@ namespace dxvk {
     [[nodiscard]] const MaterialData* accessExternalMaterial(remixapi_MaterialHandle handle) const;
     void destroyExternalMaterial(remixapi_MaterialHandle handle);
 
-    void registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes);
+    void registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes, bool replace = false);
     // Shared pointer because destroyExternalMesh can erase the entry while
     // cached draw calls still point into it.
     [[nodiscard]] std::shared_ptr<const std::vector<RasterGeometry>> accessExternalMesh(remixapi_MeshHandle handle) const;

@@ -106,6 +106,11 @@ protected:
 };
 
 struct ExternalDrawState {
+  // Non-zero when this submission came from a retained registration. The full
+  // path writes the node it resolves back to that registration, so later frames
+  // can address it directly instead of re-deriving it from hashes. Transient:
+  // it describes this submission, not the registration.
+  uint64_t retainedHandle = 0;
   DrawCallState drawCall {};
   remixapi_MeshHandle mesh {};
   CameraType::Enum cameraType {};
@@ -113,6 +118,11 @@ struct ExternalDrawState {
   bool doubleSided {};
   std::optional<RtxParticleSystemDesc> optionalParticleDesc {};
   std::vector<Matrix4> gpuInstancingTransforms {};
+  // Expanded grass. The placement snapshot is shared and immutable; the wind
+  // only ever rewrites vertex contents, never the placements themselves.
+  std::shared_ptr<NativeInstanceSet> nativeInstanceSet;
+  Vector4 nativeGrassWind;
+  bool hasNativeGrassWind = false;
 
   // Draw-instance identity for ReplacementInstance lookup. Excludes per-frame camera matrices
   // (worldToView / viewToProjection / objectToView) filled in submitExternalDraw after hashing.
@@ -135,6 +145,7 @@ public:
 
   void initialize(Rc<DxvkContext> ctx);
   void logStatistics();
+  bool hasNativeRefraction() const { return m_hasNativeRefraction; }
 
   void onDestroy();
 
@@ -161,11 +172,15 @@ public:
   void setStartInMediumMaterial(const MaterialData& translucentMaterial);
   void clearStartInMediumMaterial();
 
+  // Called on the CS thread after an in-place host material update.
+  void notifyExternalMaterialChanged() { m_externalMaterialsDirty = true; }
+
   // Remove an externally created mesh and all associated replacement instances.
   // Note: this is only safe to call from the dxvk-cs thread.
   // When the last external mesh goes away, tears the scene down and releases unused
   // DXVK chunks (see REMIX-5845) because an API client may never present again.
   void destroyExternalMesh(const Rc<DxvkContext>& ctx, remixapi_MeshHandle handle);
+  void invalidateExternalMesh(remixapi_MeshHandle handle);
   
   void setExternalStartInMediumMaterial(const MaterialData& translucentMaterial);
   void clearExternalStartInMediumMaterial();
@@ -475,13 +490,93 @@ private:
   // says otherwise. The host's transform is kept apart from the state because
   // the replay rewrites the state's copy in place to rebase it.
   struct RetainedExternalDraw {
+    // Field order matters here. The replay walks every registration every frame
+    // and, for the thousands it preserves, reads only the handful of fields
+    // below. They are kept ahead of the ExternalDrawState so that walk touches a
+    // couple of cache lines per entry instead of striding over the several
+    // hundred bytes of draw state it does not need.
     uint64_t handle = 0;
-    ExternalDrawState state {};
+    // Bumped whenever the host changes this registration. The replay compares it
+    // against the revision it last submitted in full: an entry the host has not
+    // touched describes the same draw it did last frame, so the runtime does not
+    // have to re-derive it.
+    uint64_t revision = 1;
+    uint64_t replayedRevision = 0;
+    uint64_t cachedForRevision = 0;
+    bool preserveEligibleThisFrame = false;
     Matrix4 absoluteObjectToWorld;
+
+    // The scene node this registration owns. Identity hashing and the two-level
+    // lookup exist so Remix can work out which node a D3D9 draw call belongs to.
+    // A host that registers its nodes explicitly already knows, so the replay
+    // holds the node and does no hashing and no lookup at all.
+    //
+    // The pointer is kept alive by ReplacementInstance::hostOwned, which exempts
+    // it from garbage collection. The teardowns that can still take it -- a
+    // device reset, an asset being removed -- report the owning handle back
+    // through DrawCallTracker, and the replay drops the pointer before reading
+    // it again.
+    ReplacementInstance* node = nullptr;
+    std::shared_ptr<const std::vector<RasterGeometry>> cachedSubmeshes;
+
+    // Mirrors of the two things the preserve path needs out of the draw state.
+    // Reading them from the state itself costs a cache line several hundred
+    // bytes further into the entry, per entry, every frame -- which is most of
+    // what the replay was spending on the draws it preserves unchanged.
+    CameraType::Enum cameraType = CameraType::Main;
+    bool hasParticleDesc = false;
+
+    ExternalDrawState state {};
   };
+
+  // Preserve counterpart of submitExternalDraw that runs off the stored
+  // registration rather than a copy of it. Returns false when the draw has to
+  // take the full path after all.
+  bool tryPreserveRetainedExternalDraw(const Rc<DxvkContext>& ctx, RetainedExternalDraw& entry,
+                                      bool preservePathUsable);
   std::vector<RetainedExternalDraw> m_retainedExternalDraws;
   std::unordered_map<uint64_t, size_t> m_retainedExternalIndex;
+  // Surface material upload scratch, kept across frames so the buffer is not
+  // reallocated and zeroed every frame, plus what was packed into each slot.
+  std::vector<unsigned char> m_surfaceMaterialsGPUData;
+  bool m_externalMaterialsDirty = false;
+  struct PackedSurfaceMaterial {
+    const RtInstance* instance = nullptr;
+    uint32_t materialIndex = UINT32_MAX;
+  };
+  std::vector<PackedSurfaceMaterial> m_packedSurfaceMaterialIndex;
+
   Vector3 m_retainedSceneOrigin { 0.f, 0.f, 0.f };
+  // The origin the last replay rebased against. Moving it changes every
+  // retained draw's object-to-world, so no entry may take the preserve path on
+  // the frame it moves.
+  Vector3 m_retainedSceneOriginLastReplay { 0.f, 0.f, 0.f };
+  bool m_retainedReplayHasRun = false;
+  bool m_hasNativeRefraction = false;
+  uint32_t m_retainedPreservedThisFrame = 0;
+  uint32_t m_retainedResubmittedThisFrame = 0;
+  uint32_t m_preserveMissChanged = 0;
+  uint32_t m_preserveMissParticles = 0;
+  uint32_t m_preserveMissNoSubmeshes = 0;
+  uint32_t m_preserveMissNoInstance = 0;
+  uint32_t m_preserveMissDirty = 0;
+  uint32_t m_preserveMissPrimCount = 0;
+  uint32_t m_preserveMissGrass = 0;
+  uint32_t m_preserveMissPrimState = 0;
+  uint32_t m_preserveMissDirtyTransform = 0;
+  uint32_t m_preserveMissDirtyVertex = 0;
+  uint32_t m_preserveMissDirtyMaterial = 0;
+  uint32_t m_preserveMissDirtyOther = 0;
+  uint32_t m_preserveMissDirtyParticle = 0;
+  uint32_t m_preserveMissNoNode = 0;
+  // Evidence for the instance-set motion-vector fix: how much world motion the
+  // placements would have reported had the origin change been passed through.
+  uint32_t m_instanceSetDrawsThisFrame = 0;
+  // Splits the preserve path's per-instance cost between its two halves.
+  double m_preserveSceneNs = 0.0;
+  double m_preserveInstanceNs = 0.0;
+  uint32_t m_preserveCalls = 0;
+  float m_instanceSetSpuriousMotion = 0.f;
 };
 
 }  // namespace nvvk

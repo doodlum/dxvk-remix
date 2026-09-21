@@ -122,6 +122,9 @@ void TraceRayCustom<payload_t : IBasePayloadState>(
   payload.origin = ray.origin;                                                            \
   payload.coneRadius = ray.coneRadius;                                                    \
   payload.direction = ray.direction;                                                      \
+  /* NV-DXVK start: Preserve the hardware ray through ordered transparency. */             \
+  payload.resolveRayT = 0.0f;                                                             \
+  /* NV-DXVK end */                                                                       \
                                                                                           \
   /* Loop until a surface is resolved, or the maximum interaction count is hit */         \
   uint8_t interactionIteration;                                                           \
@@ -130,6 +133,9 @@ void TraceRayCustom<payload_t : IBasePayloadState>(
     /* Reset the hit distance used for Resolve logic for this next iteration */           \
                                                                                           \
     payload.continueResolving = interactionIteration < maxInteractions;                   \
+    /* NV-DXVK start: Continuation must explicitly opt into preserving the ray. */          \
+    payload.continueOriginalRay = false;                                                   \
+    /* NV-DXVK end */                                                                     \
                                                                                           \
     /* Preform the ray trace with the desired information */                              \
                                                                                           \
@@ -174,9 +180,15 @@ void TraceRayCustom<payload_t : IBasePayloadState>(
                                                                                           \
     /* Update current ray for next iteration */                                           \
                                                                                           \
-    currentRay.Origin = payload.origin;                                                   \
-    currentRay.Direction = payload.direction;                                             \
-    currentRay.TMax = max(currentRay.TMax - segmentHitDistance, 0.0f);                    \
+    /* NV-DXVK start: Advance T without moving through closely spaced surfaces. */          \
+    if (!advanceResolveRay(currentRay, payload))                                           \
+    {                                                                                     \
+      RayHitInfo exhaustedHit;                                                            \
+      exhaustedHit.hasHit = false;                                                         \
+      hitFunction(extraArgs, exhaustedHit, payload);                                       \
+      break;                                                                              \
+    }                                                                                     \
+    /* NV-DXVK end */                                                                     \
   }                                                                                       \
                                                                                           \
   if ((cb.debugView == interactionsDebugView1 || cb.debugView == interactionsDebugView2)  \
@@ -205,6 +217,9 @@ void TraceRayCustom<payload_t : IBasePayloadState>(
   payload.origin = ray.origin;                                                            \
   payload.coneRadius = ray.coneRadius;                                                    \
   payload.direction = ray.direction;                                                      \
+  /* NV-DXVK start: Preserve the hardware ray through ordered transparency. */             \
+  payload.resolveRayT = 0.0f;                                                             \
+  /* NV-DXVK end */                                                                       \
                                                                                           \
   /* Loop until a surface is resolved, or the maximum interaction count is hit */         \
   uint8_t interactionIteration;                                                           \
@@ -213,6 +228,9 @@ void TraceRayCustom<payload_t : IBasePayloadState>(
     /* Reset the hit distance used for Resolve logic for this next iteration */           \
                                                                                           \
     payload.continueResolving = interactionIteration < maxInteractions;                   \
+    /* NV-DXVK start: Continuation must explicitly opt into preserving the ray. */          \
+    payload.continueOriginalRay = false;                                                   \
+    /* NV-DXVK end */                                                                     \
                                                                                           \
     /* Preform the ray trace with the desired information */                              \
                                                                                           \
@@ -247,9 +265,15 @@ void TraceRayCustom<payload_t : IBasePayloadState>(
                                                                                           \
     /* Update current ray for next iteration */                                           \
                                                                                           \
-    currentRay.Origin = payload.origin;                                                   \
-    currentRay.Direction = payload.direction;                                             \
-    currentRay.TMax = max(currentRay.TMax - segmentHitDistance, 0.0f);                    \
+    /* NV-DXVK start: Advance T without moving through closely spaced surfaces. */          \
+    if (!advanceResolveRay(currentRay, payload))                                           \
+    {                                                                                     \
+      RayHitInfo exhaustedHit;                                                            \
+      exhaustedHit.hasHit = false;                                                         \
+      hitFunction(extraArgs, exhaustedHit, payload);                                       \
+      break;                                                                              \
+    }                                                                                     \
+    /* NV-DXVK end */                                                                     \
   }                                                                                       \
                                                                                           \
   if ((cb.debugView == interactionsDebugView1 || cb.debugView == interactionsDebugView2)  \

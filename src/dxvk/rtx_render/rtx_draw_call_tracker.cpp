@@ -170,6 +170,37 @@ namespace dxvk {
     }
   }
 
+  ReplacementInstance* DrawCallTracker::trackRetainedDraw(
+      const ReplacementInstance::LookupKey& key, uint64_t handle,
+      uint32_t frameId, ReplacementInstance* pNode) {
+    assert(handle);
+    if (pNode == nullptr) {
+      auto node = std::make_unique<ReplacementInstance>(key, m_nextReplacementInstanceId++, frameId);
+      pNode = node.get();
+      pNode->hostOwned = true;
+      pNode->hostRetainedHandle = handle;
+      m_replacementInstances.push_back(std::move(node));
+      return pNode;
+    }
+
+    assert(pNode->hostOwned && pNode->hostRetainedHandle == handle);
+    if (pNode->spatialMapHash != key.spatialMapHash) {
+      pNode->clear();
+    } else if (pNode->identityHash != key.identityHash) {
+      computeDirtyFlags(pNode, key);
+    } else if (pNode->frameLastSeen != frameId) {
+      pNode->dirtyFlags.clr(ReplacementInstance::kLookupDriftMask);
+    }
+    pNode->identityHash = key.identityHash;
+    pNode->spatialMapHash = key.spatialMapHash;
+    pNode->materialHash = key.materialHash;
+    pNode->vertexPositionHash = key.vertexPositionHash;
+    pNode->centroid = key.worldPos;
+    pNode->textureTransform = key.textureTransform;
+    pNode->texgenMode = key.texgenMode;
+    return pNode;
+  }
+
   ReplacementInstance* DrawCallTracker::findOrCreateReplacementInstance(
       const ReplacementInstance::LookupKey& key) {
     ScopedCpuProfileZone();
@@ -358,10 +389,17 @@ namespace dxvk {
       return;
     }
 
-    m_identityHashMap.erase(replacementInstance->identityHash);
+    if (replacementInstance->hostRetainedHandle != 0 && m_onHostNodeDestroyed) {
+      m_onHostNodeDestroyed(replacementInstance->hostRetainedHandle);
+    }
 
-    eraseFromSpatialMap(m_assetSpatialMaps, replacementInstance->spatialMapHash,
-        replacementInstance->spatialCacheTransformHash, replacementInstance);
+    // Retained nodes are not indexed, even after their host releases them.
+    const auto indexed = m_identityHashMap.find(replacementInstance->identityHash);
+    if (indexed != m_identityHashMap.end() && indexed->second == replacementInstance) {
+      m_identityHashMap.erase(indexed);
+      eraseFromSpatialMap(m_assetSpatialMaps, replacementInstance->spatialMapHash,
+          replacementInstance->spatialCacheTransformHash, replacementInstance);
+    }
 
     replacementInstance->clear();
   }
@@ -382,6 +420,12 @@ namespace dxvk {
 
     for (size_t i = 0; i < m_replacementInstances.size();) {
       ReplacementInstance* replacementInstance = m_replacementInstances[i].get();
+
+      // Host-owned nodes have an explicit lifetime; only the host removes them.
+      if (replacementInstance->hostOwned) {
+        ++i;
+        continue;
+      }
 
       const bool hasLights = replacementInstance->lightBoundingBox.isValid();
       const bool hasMeshes = replacementInstance->geometryBoundingBox.isValid();
@@ -457,6 +501,11 @@ namespace dxvk {
   }
 
   void DrawCallTracker::clear() {
+    for (const auto& pNode : m_replacementInstances) {
+      if (pNode->hostRetainedHandle && m_onHostNodeDestroyed) {
+        m_onHostNodeDestroyed(pNode->hostRetainedHandle);
+      }
+    }
     m_identityHashMap.clear();
     m_assetSpatialMaps.clear();
     m_replacementInstances.clear();

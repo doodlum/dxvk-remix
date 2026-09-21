@@ -21,6 +21,8 @@
 */
 #pragma once
 
+#include <functional>
+
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -58,6 +60,10 @@ public:
   ReplacementInstance* findOrCreateReplacementInstance(
     const ReplacementInstance::LookupKey& key);
 
+  // Retained registrations have explicit identity; they never enter spatial matching.
+  ReplacementInstance* trackRetainedDraw(const ReplacementInstance::LookupKey& key,
+      uint64_t handle, uint32_t frameId, ReplacementInstance* pNode);
+
   // Wrapper for the above function that constructs the LookupKey from the DrawCallState.
   ReplacementInstance* findOrCreateReplacementInstance(
       const DrawCallState& drawCallState,
@@ -85,6 +91,16 @@ public:
   // Rebuild all spatial maps with a new cell size.
   // Call when uniqueObjectDistance changes.
   void rebuildSpatialMaps(float cellSize);
+
+  // Called the moment a host-owned node is destroyed, with the handle of the
+  // registration that owns it, so that registration can drop its pointer before
+  // anything reads it. Deferring this to a drain at the start of the next replay
+  // was not enough: an asset removed mid-frame left the pointer dangling for the
+  // rest of that frame. A generation counter was tried first and was useless --
+  // one unrelated teardown a frame invalidated every held node.
+  void setHostNodeDestroyedCallback(std::function<void(uint64_t)> callback) {
+    m_onHostNodeDestroyed = std::move(callback);
+  }
 
   const std::vector<std::unique_ptr<ReplacementInstance>>& getReplacementInstances() const {
     return m_replacementInstances;
@@ -131,6 +147,7 @@ private:
       const ReplacementInstance::LookupKey& key,
       ReplacementSpatialMap* moveInAssetMap);
 
+  std::function<void(uint64_t)> m_onHostNodeDestroyed;
   std::vector<std::unique_ptr<ReplacementInstance>> m_replacementInstances;
   uint32_t m_nextReplacementInstanceId = 0;
 

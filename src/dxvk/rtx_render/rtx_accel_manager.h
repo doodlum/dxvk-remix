@@ -81,7 +81,11 @@ class AccelManager : public CommonDeviceObject {
     uint8_t instanceMask = 0;
     bool usesUnorderedApproximations = false;
     bool isSubsurface = false;
-    uint8_t pad = 0;
+    // Whether the instance was preserved rather than re-derived this frame.
+    // Buckets are the unit the incremental cache invalidates, so keeping the
+    // handful of instances that change out of the buckets holding the thousands
+    // that do not is what lets the clean ones survive.
+    bool isStatic = false;
 
     bool operator==(const BlasBucketKey& other) const {
       return instanceMask == other.instanceMask &&
@@ -89,7 +93,8 @@ class AccelManager : public CommonDeviceObject {
              customIndexFlags == other.customIndexFlags &&
              instanceFlags == other.instanceFlags &&
              usesUnorderedApproximations == other.usesUnorderedApproximations &&
-             isSubsurface == other.isSubsurface;
+             isSubsurface == other.isSubsurface &&
+             isStatic == other.isStatic;
     }
   };
 
@@ -102,7 +107,7 @@ class AccelManager : public CommonDeviceObject {
           &BlasBucketKey::instanceMask,
           &BlasBucketKey::usesUnorderedApproximations,
           &BlasBucketKey::isSubsurface,
-          &BlasBucketKey::pad>(k));
+          &BlasBucketKey::isStatic>(k));
     }
   };
 
@@ -193,6 +198,12 @@ private:
     std::vector<unsigned char> surfacesGPUData;
     std::vector<uint32_t> surfaceIndexMapping;
     uint32_t previousFrameSurfaceCount = 0; // Tracks last frame's surface count for mapping coverage
+    // Which instance's surface was packed into each slot of surfacesGPUData, and
+    // the first-index offset it was packed with. An instance that was preserved
+    // this frame and still sits in the same slot has the same bytes there
+    // already, so packing it again writes what is already written.
+    std::vector<const RtInstance*> packedInstance;
+    std::vector<uint32_t> packedFirstIndexOffset;
   } uploadSurfaceDataFuncState;
 
   void buildBlases(Rc<DxvkContext> ctx, DxvkBarrierSet& execBarriers,
@@ -270,10 +281,44 @@ private:
     bool hasSssInstances = false;
   };
   std::vector<CachedBucketState> m_cachedBuckets;
+  // Buckets that lost an instance since the last merge and so must be rebuilt.
+  // Evicting one instance used to clear the whole cache, which meant the
+  // incremental path never ran in a scene with any instance churn at all.
+  std::unordered_set<uint32_t> m_forcedDirtyBuckets;
+
+  // Instance destructions seen since the last report, and how many of those
+  // were instances the bucket cache was actually holding.
+  uint32_t m_bucketCacheEvictionsThisFrame = 0;
+  uint32_t m_bucketCacheCachedEvictionsThisFrame = 0;
+  std::unordered_map<XXH64_hash_t, uint32_t> m_evictedMaterialHashes;
+  uint32_t m_evictedBillboardInstances = 0;
+  uint32_t m_churnRoutedInstances = 0;
+
+  // Material hash -> frame the mesh was last destroyed while cached. Entries
+  // older than kChurnMemoryFrames are dropped so a mesh that settles down
+  // returns to the merged buckets.
+  static constexpr uint32_t kChurnMemoryFrames = 120;
+  std::unordered_map<XXH64_hash_t, uint32_t> m_churningMaterials;
+  uint32_t m_currentFrameForChurn = 0;
+
+  // Which validation check dirtied a bucket, summed over the reporting window.
+  uint32_t m_dirtyReasonEvicted = 0;
+  uint32_t m_dirtyReasonIdentity = 0;
+  uint32_t m_dirtyReasonBlasDirty = 0;
+  uint32_t m_dirtyReasonBlasUpdated = 0;
+  uint32_t m_dirtyReasonBucketKey = 0;
+  uint32_t m_dirtyReasonSizeMismatch = 0;
 
   // Maps a merged instance pointer to its bucket index in m_cachedBuckets.
   // Allows O(1) "is this instance in a clean bucket?" check in the main loop.
-  std::unordered_map<RtInstance*, uint32_t> m_instanceBucketIndex;
+  // Bumped whenever every instance's cached bucket index becomes stale. Starts
+  // at 1 because zero is the "not cached" stamp on RtInstance.
+  uint64_t m_bucketCacheGeneration = 1;
+
+  // Splits the merge loop's cost between the instances it skips and the ones it
+  // actually processes, so the two can be optimised separately.
+  uint32_t m_mergeCleanSkips = 0;
+  uint32_t m_mergeDirtyVisits = 0;
 
   // Set of BlasEntry* that went to the dynamic path on the last full rebuild.
   // Used for quick O(1) per-instance classification on the dynamics-only path.

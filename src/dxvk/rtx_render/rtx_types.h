@@ -142,6 +142,20 @@ struct ReplacementInstance {
 
   ReplacementInstance(const LookupKey& key, uint32_t newId, uint32_t frameId);
 
+  // Set when a host registration owns this node through the retained external
+  // draw API. The host holds the pointer and decides when the node dies, so
+  // garbage collection -- which exists to reclaim instances a D3D9 game simply
+  // stopped drawing -- must leave it alone. Identity hashing and the two-level
+  // lookup exist to re-derive which node a draw call belongs to; a host that
+  // registers nodes explicitly already knows, and skips both.
+  bool hostOwned = false;
+
+  // The retained registration that owns this node, or 0. Destroying the node
+  // reports this handle back so the owner can drop its pointer -- precise
+  // invalidation, rather than a generation counter that a single unrelated
+  // teardown would use to invalidate every held node at once.
+  uint64_t hostRetainedHandle = 0;
+
   // Per-submission update routing. Lookup-drift bits (Transform, VertexPosHash,
   // MaterialHash, Other) reflect LookupKey changes; cleared on the first exact-match
   // lookup each frame. Dynamic-feature bits (ParticleSystem, EffectLight) are set
@@ -172,6 +186,9 @@ struct ReplacementInstance {
   inline static const DirtyFlags kAllDirtyFlags = kLookupDriftMask | kDynamicFeatureMask;
 
   ~ReplacementInstance();
+
+  // Retire explicitly removed host prims without unseen-draw lifetime extension.
+  void releaseHost();
 
   // Mark all prim entities for GC, drop the prim/root slots, reset cached
   // aggregate bounding boxes, and clear activeReplacements. Returns the RI to
@@ -318,7 +335,8 @@ struct RaytraceGeometry {
   // normals in model space and authors its own vertex normals, and its terrain
   // carries per-vertex blend weights for a five-layer material.
   bool modelSpaceNormals = false;
-  bool preserveVertexNormals = false;
+  bool nativeTangentFrame = false;
+  bool useFaceNormals = false;
   bool nativeLandscape = false;
   // Cached hashes from draw call on last update
   GeometryHashes hashes;
@@ -368,7 +386,8 @@ struct RasterGeometry {
   // modelSpaceNormals the normal buffer holds a nine-float basis rather than a
   // normal. Expanded grass repeats one prototype's topology per placement.
   bool modelSpaceNormals = false;
-  bool preserveVertexNormals = false;
+  bool nativeTangentFrame = false;
+  bool useFaceNormals = false;
   bool nativeLandscape = false;
   bool nativeGrass = false;
   bool nativeGrassHasWind = false;

@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cmath>
 /*
 * Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
@@ -27,12 +29,36 @@ namespace {
   // 6x frame generation: 1 rendered frame + up to 5 interpolated frames
   constexpr uint32_t kDLFGMaxInterpolatedFrames = 6;
   constexpr uint64_t kPacerDoNotWait = uint64_t(-1);
+  // Sentinel for VkSetPresentConfigNV::presentConfigFeedback: any driver that
+  // applies the config overwrites it (0 = accepted).
+  constexpr uint32_t kPresentMeteringUntouched = 0xFFFFFFFFu;
 
   // debugging flags
-  constexpr bool kSkipPacerSemaphoreWait = false;  // do not wait on pacer semaphore; this disables frame pacing, but still runs the pacer code
+  // Measurement lever: with metering off, this is the only remaining pacing. Both
+  // disabled together answers whether the ~19 ms each present blocks for is
+  // deliberate spacing or real GPU work.
+  const bool kSkipPacerSemaphoreWait = std::getenv("CS_REMIX_NO_PACING") != nullptr;
+  // The backbuffer's last use is the blit into the swapchain image, and that blit
+  // signals m_backbufferAcquireSemaphores[i] -- the very semaphore the renderer
+  // waits on before writing that backbuffer again. Holding the CPU-side in-flight
+  // flag until both presents have returned is therefore redundant with a GPU
+  // ordering guarantee that already exists, and it is what gates the renderer:
+  // the ring sits full, every acquire blocks, and the render rate is pinned to
+  // the present thread's rate. Releasing the slot once the blit is submitted
+  // keeps the ordering (the semaphore still enforces it) and lets the game
+  // thread run ahead of presenting.
+  const bool kEarlyBackbufferRelease = std::getenv("CS_REMIX_EARLY_BB_RELEASE") != nullptr;
+  // Present-to-present spacing, bucketed by position in the job, so pacing can
+  // be judged from the log: correct x2 pacing is both buckets equal with a low
+  // spread. Logged under the same switch as the phase timers.
+  const bool kLogPresentPacing = std::getenv("CS_REMIX_GPU_PHASES") != nullptr;
+  uint32_t g_dlfgPresentInJob = 0;  // do not wait on pacer semaphore; this disables frame pacing, but still runs the pacer code
 };
 
 namespace dxvk {
+  extern std::atomic<uint32_t> g_injectSkippedSameFrame, g_injectSkippedCameraInvalid,
+                               g_injectSkippedAsyncShaders, g_injectSkippedRtDisabled,
+                               g_injectReachedRender, g_dlfgDispatched;
   template<uint numBarriers>
   class DxvkDLFGImageBarrierSet {
   public:
@@ -213,8 +239,46 @@ namespace dxvk {
 
     // stall until the image is available
     {
+      // Splits this wait between taking the mutex and waiting on the flag. The
+      // ring-occupancy probe below runs after the lock is held, so it cannot see
+      // which of the two the game thread actually lost its frame to.
+      const auto lockStart = std::chrono::steady_clock::now();
       std::unique_lock<dxvk::mutex> lock(m_presentThread.mutex);
+      const auto lockEnd = std::chrono::steady_clock::now();
+      // How full the ring is when this blocks says whether the game thread is
+      // genuinely running ahead (ring full, present thread is the limiter) or is
+      // stuck on one slot while others sit free (rotation is the limiter).
+      {
+        static double blockedTotal = 0.0, inFlightTotal = 0.0, queueTotal = 0.0;
+        static uint32_t samples = 0, blockedSamples = 0;
+        uint32_t inFlight = 0;
+        for (bool f : m_backbufferInFlight) {
+          inFlight += f ? 1u : 0u;
+        }
+        const bool willBlock = m_backbufferInFlight[m_backbufferIndex];
+        inFlightTotal += inFlight;
+        queueTotal += double(m_presentQueue.size());
+        blockedSamples += willBlock ? 1u : 0u;
+        if (++samples % 240 == 0) {
+          Logger::info(str::format("[RTX.acquire] ring ", m_backbufferInFlight.size(),
+            ", in flight ", inFlightTotal / 240.0, ", queued jobs ", queueTotal / 240.0,
+            ", blocked ", 100.0 * blockedSamples / 240.0, "% of acquires (mean of 240)"));
+          inFlightTotal = queueTotal = 0.0; samples = 0; blockedSamples = 0;
+        }
+      }
       m_presentThread.condWorkConsumed.wait(lock, [this] { return m_backbufferInFlight[m_backbufferIndex] == false; });
+      {
+        static double lockTotal = 0.0, waitTotal = 0.0;
+        static uint32_t samples = 0;
+        lockTotal += std::chrono::duration<double, std::milli>(lockEnd - lockStart).count();
+        waitTotal += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - lockEnd).count();
+        if (++samples % 240 == 0) {
+          Logger::info(str::format("[RTX.acquiresplit] take mutex ", lockTotal / 240.0,
+            " ms | wait on flag ", waitTotal / 240.0, " ms (mean of 240)"));
+          lockTotal = waitTotal = 0.0;
+        }
+      }
     }
 
     index = m_backbufferIndex;
@@ -253,6 +317,28 @@ namespace dxvk {
       m_presentThread.condWorkAvailable.notify_all();
     }
 
+    // NV-DXVK start: rendered-frame rate counter
+    // This entry point is reached exactly once per rendered frame, so it is the
+    // only place that can separate render cost from generated-frame cadence.
+    // The presenter-side counter sees every swapchain present and cannot.
+    {
+      static std::mutex renderRateMutex;
+      static std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+      static uint32_t rendered = 0;
+      std::lock_guard lock(renderRateMutex);
+      ++rendered;
+      const auto now = std::chrono::steady_clock::now();
+      const double elapsed = std::chrono::duration<double>(now - windowStart).count();
+      if (elapsed >= 2.0) {
+        Logger::info(str::format("[RTX.render] ", rendered / elapsed, " rendered/s (",
+                                 1000.0 * elapsed / rendered, " ms each, x",
+                                 frameInterpolationInfo.interpolatedFrameCount + 1, " presented)"));
+        windowStart = now;
+        rendered = 0;
+      }
+    }
+    // NV-DXVK end
+
     // stash the number of frames we will present, so the HUD can calculate FPS
     m_lastPresentFrameCount = frameInterpolationInfo.interpolatedFrameCount + 1;
 
@@ -269,7 +355,24 @@ namespace dxvk {
     // Allocate only as many swapchain images as the configured multiplier needs (interpolated + 1 rendered),
     // rather than always allocating the hardware maximum. Swapchain will be recreated if the user increases
     // the multiplier at runtime (see acquireNextImage).
-    adjustedDesc.imageCount = m_ctx->dlfgInterpolatedFrameCount() + 1;
+    // One image per frame in a batch is the minimum that can be presented, not
+    // the number that lets the present thread run ahead of the display. With the
+    // minimum, every present waits for the presentation engine to hand an image
+    // back, and the stall lands on whoever acquires next -- on D3D11 that is the
+    // game thread, which sat in acquireNextImage for 16.8 ms of a 25 ms frame.
+    // One spare image per batch lets the next batch be prepared while the
+    // current one is on screen.
+    // This is the real VkSwapchain, not the backbuffer ring: each job presents
+    // interpolatedFrameCount + 1 images, so at this size vkQueuePresentKHR has
+    // to wait for the presentation engine to hand one back, and that wait lands
+    // on the present thread and then on whoever acquires next.
+    {
+      const uint32_t minimum = m_ctx->dlfgInterpolatedFrameCount() + 2;
+      const char* v = std::getenv("CS_REMIX_DLFG_SWAPCHAIN_IMAGES");
+      const uint32_t override = v ? uint32_t(std::max(0, atoi(v))) : 0u;
+      adjustedDesc.imageCount = override ? std::max(override, minimum) : minimum;
+      Logger::info(str::format("[RTX.dlfg] vulkan swapchain image count ", adjustedDesc.imageCount));
+    }
     
     VkResult res = vk::Presenter::recreateSwapChain(adjustedDesc);
     if (res != VK_SUCCESS) {
@@ -395,7 +498,20 @@ namespace dxvk {
   }
 
   bool DxvkDLFGPresenter::swapchainAcquire(SwapchainImage& swapchainImage) {
+    // The present-thread job takes as long as a rendered frame; this says how
+    // much of that is the presentation engine handing an image back.
+    const auto acquireStart = std::chrono::steady_clock::now();
     m_lastPresentStatus = vk::Presenter::acquireNextImage(swapchainImage.sync, swapchainImage.index, true);
+    {
+      static double total = 0.0;
+      static uint32_t samples = 0;
+      total += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - acquireStart).count();
+      if (++samples % 240 == 0) {
+        Logger::info(str::format("[RTX.dlfgacq] swapchain acquire inside present job ", total / 240.0, " ms (mean of 240)"));
+        total = 0.0;
+      }
+    }
     if (m_lastPresentStatus != VK_SUCCESS) {
       // got an error, bail until it's handled
       // xxxnsubtil: may need to signal the frame end semaphore here
@@ -539,6 +655,31 @@ namespace dxvk {
     m_lastPresentStatus = vk::Presenter::presentImage(present.status, present.present, present.frameInterpolation, image.index, true, presentMetering);
     reflex.endOutOfBandPresent(present.present.cachedReflexFrameId);
 
+    if (kLogPresentPacing) {
+      using clock = std::chrono::steady_clock;
+      static clock::time_point s_prevReturn;
+      static bool s_havePrev = false;
+      static double s_sum[2] = {}, s_sumSq[2] = {};
+      static uint32_t s_n[2] = {};
+      const auto now = clock::now();
+      if (s_havePrev) {
+        const uint32_t bucket = std::min<uint32_t>(g_dlfgPresentInJob, 1u);
+        const double ms = std::chrono::duration<double, std::milli>(now - s_prevReturn).count();
+        s_sum[bucket] += ms; s_sumSq[bucket] += ms * ms; ++s_n[bucket];
+        if (s_n[0] + s_n[1] >= 240) {
+          auto stat = [&](uint32_t b) {
+            const double m = s_n[b] ? s_sum[b] / s_n[b] : 0.0;
+            const double v = s_n[b] ? std::max(0.0, s_sumSq[b] / s_n[b] - m * m) : 0.0;
+            return str::format(m, " ms sd ", m > 0.0 ? 100.0 * std::sqrt(v) / m : 0.0, "% (n=", s_n[b], ")");
+          };
+          Logger::info(str::format("[RTX.pacing] rendered->interp ", stat(0), " | interp->rendered ", stat(1)));
+          s_sum[0] = s_sum[1] = s_sumSq[0] = s_sumSq[1] = 0.0; s_n[0] = s_n[1] = 0;
+        }
+      }
+      s_prevReturn = now; s_havePrev = true;
+      ++g_dlfgPresentInJob;
+    }
+
     if (m_lastPresentStatus == VK_SUCCESS) {
       NsightGraphicsCapture::signalFrameBoundary(m_device->queues().__DLFG_QUEUE.queueHandle);
       NsightGraphicsCapture::processPendingCaptureRequest();
@@ -570,12 +711,77 @@ namespace dxvk {
 
       PresentJob present = std::move(m_presentQueue.front());
 
+      // Interpolating and presenting takes as long as a rendered frame, and none
+      // of it touches state this mutex guards. Holding it across that work blocks
+      // the game thread in acquireNextImage, which only needs the mutex to read a
+      // flag -- measured at 29.6 ms of a 37.9 ms frame, with the backbuffer ring
+      // empty the whole time. The job stays on the queue until the guard below
+      // pops it, so synchronize() still waits for it.
+      lock.unlock();
+
+      // The game thread's acquire stall is as long as this job takes, so the job
+      // needs its own breakdown rather than being inferred from the stall.
+      const auto jobStart = std::chrono::steady_clock::now();
+      struct JobTimer {
+        std::chrono::steady_clock::time_point start;
+        ~JobTimer() {
+          static double total = 0.0;
+          static uint32_t samples = 0;
+          total += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+          if (++samples % 120 == 0) {
+            Logger::info(str::format("[RTX.dlfgjob] present-thread job ", total / 120.0, " ms (mean of 120)"));
+            total = 0.0;
+          }
+        }
+      } jobTimer { jobStart };
+
+      // Phase split for the job timer above. nextCmdList blocks on a command
+      // list's fence, so it is where GPU work shows up on this thread rather
+      // than as GPU busy; whatever remains is interpolation and presenting.
+      static double tCmdList = 0.0, tInterp = 0.0, tRecord = 0.0, tPresent1 = 0.0, tPresentRest = 0.0;
+      static uint32_t jobPhaseSamples = 0;
+      std::chrono::steady_clock::time_point interpStart = jobStart;
+      std::chrono::steady_clock::time_point recordEnd = jobStart;
+      std::chrono::steady_clock::time_point present1End = jobStart;
+      bool backbufferReleased = false;
+
+      // Frees the backbuffer ring slot as soon as the blit that consumes it has
+      // been submitted, rather than after the presents. Safe because the blit
+      // signals the semaphore the next writer of this backbuffer waits on.
+      auto releaseBackbuffer = [&]() {
+        if (backbufferReleased) {
+          return;
+        }
+        backbufferReleased = true;
+        std::unique_lock<dxvk::mutex> releaseLock(m_presentThread.mutex);
+        m_backbufferInFlight[present.acquiredImageIndex] = false;
+        m_presentThread.condWorkConsumed.notify_all();
+      };
+
       DxvkDLFGScopeGuard signalWorkConsumed([&]() {
         // m_device->vkd()->vkQueueWaitIdle(m_device->queues().__DLFG_QUEUE.queueHandle);
+        const auto jobEnd = std::chrono::steady_clock::now();
+        tInterp += std::chrono::duration<double, std::milli>(jobEnd - interpStart).count();
+        tRecord += std::chrono::duration<double, std::milli>(recordEnd - interpStart).count();
+        tPresent1 += std::chrono::duration<double, std::milli>(present1End - recordEnd).count();
+        tPresentRest += std::chrono::duration<double, std::milli>(jobEnd - present1End).count();
+        if (++jobPhaseSamples % 120 == 0) {
+          Logger::info(str::format("[RTX.dlfgphase] nextCmdList ", tCmdList / 120.0,
+            " ms | record+submit interp ", tRecord / 120.0,
+            " ms | present#1 ", tPresent1 / 120.0,
+            " ms | remaining presents ", tPresentRest / 120.0,
+            " ms | job ", tInterp / 120.0, " ms (mean of 120)"));
+          tCmdList = tInterp = tRecord = tPresent1 = tPresentRest = 0.0;
+        }
         present.status->store(m_lastPresentStatus);
 
-        assert(m_backbufferInFlight[present.acquiredImageIndex] == true);
-        m_backbufferInFlight[present.acquiredImageIndex] = false;
+        // Retake the mutex for the queue and flag updates the waiters watch.
+        lock.lock();
+
+        if (!backbufferReleased) {
+          m_backbufferInFlight[present.acquiredImageIndex] = false;
+        }
 
         m_presentQueue.pop();
         m_presentThread.condWorkConsumed.notify_all();
@@ -588,7 +794,10 @@ namespace dxvk {
 
       SwapchainImage renderedSwapchainImage;
 
+      const auto cmdListStart = std::chrono::steady_clock::now();
       DxvkDLFGCommandList* commandList = m_dlfgCommandLists.nextCmdList();
+      const auto cmdListEnd = std::chrono::steady_clock::now();
+      tCmdList += std::chrono::duration<double, std::milli>(cmdListEnd - cmdListStart).count();
       DxvkDLFGImageBarrierSet<4> barriers;
 
       VkSemaphore backbufferWaitSemaphore = m_backbufferPresentSemaphores[present.acquiredImageIndex]->handle();
@@ -596,6 +805,30 @@ namespace dxvk {
 
       commandList->addWaitSemaphore(backbufferWaitSemaphore);
 
+      interpStart = std::chrono::steady_clock::now();
+      g_dlfgPresentInJob = 0;
+      if (kLogPresentPacing) {
+        static uint32_t s_jobs = 0, s_valid = 0, s_noMv = 0, s_noDepth = 0, s_count0 = 0;
+        const auto& fi = present.frameInterpolation;
+        ++s_jobs;
+        if (fi.valid()) { ++s_valid; }
+        else {
+          if (!fi.motionVectors.ptr()) { ++s_noMv; }
+          if (!fi.depth.ptr()) { ++s_noDepth; }
+          if (fi.interpolatedFrameCount == 0) { ++s_count0; }
+        }
+        if (s_jobs == 120) {
+          Logger::info(str::format("[RTX.fgjobs] jobs 120 | interpolated ", s_valid,
+            " | no-FI: noMV ", s_noMv, " noDepth ", s_noDepth, " count0 ", s_count0,
+            " | injectRTX: sameFrame ", g_injectSkippedSameFrame.exchange(0),
+            " cameraInvalid ", g_injectSkippedCameraInvalid.exchange(0),
+            " asyncShaders ", g_injectSkippedAsyncShaders.exchange(0),
+            " rtDisabled ", g_injectSkippedRtDisabled.exchange(0),
+            " reachedRender ", g_injectReachedRender.exchange(0),
+            " dlfgDispatched ", g_dlfgDispatched.exchange(0)));
+          s_jobs = s_valid = s_noMv = s_noDepth = s_count0 = 0;
+        }
+      }
       if (present.frameInterpolation.valid()) {
         ScopedCpuProfileZoneN("DLFG queue: interpolate");
 
@@ -714,7 +947,28 @@ namespace dxvk {
           commandList->endRecording();
           commandList->submit();
         }
+        // Diagnostic: waiting on the interpolation command list here splits the
+        // ~19 ms each present costs into GPU work and everything after it. If the
+        // fence wait takes the time and the presents then return quickly, the
+        // presents were waiting on the GPU; if the fence is instant and the
+        // presents still cost 19 ms, they are blocked on the presentation engine.
+        static const bool kFenceSplit = std::getenv("CS_REMIX_PRESENT_FENCE_SPLIT") != nullptr;
+        if (kFenceSplit && pacer.lastCmdListFence != VK_NULL_HANDLE) {
+          const auto fenceStart = std::chrono::steady_clock::now();
+          m_device->vkd()->vkWaitForFences(m_device->vkd()->device(), 1,
+            &pacer.lastCmdListFence, VK_TRUE, 1000ull * 1000ull * 1000ull);
+          static double fenceTotal = 0.0;
+          static uint32_t fenceSamples = 0;
+          fenceTotal += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - fenceStart).count();
+          if (++fenceSamples % 120 == 0) {
+            Logger::info(str::format("[RTX.fencesplit] interp GPU wait ", fenceTotal / 120.0,
+              " ms (mean of 120)"));
+            fenceTotal = 0.0;
+          }
+        }
         commandList = nullptr;
+        recordEnd = std::chrono::steady_clock::now();
 
         reflex.endOutOfBandRendering(present.present.cachedReflexFrameId);
 
@@ -727,21 +981,45 @@ namespace dxvk {
           presentMetering.sType = VK_STRUCTURE_TYPE_SET_PRESENT_CONFIG_NV;
           presentMetering.pNext = nullptr;
           presentMetering.numFramesPerBatch = 1 + present.frameInterpolation.interpolatedFrameCount;
+          // The driver reports acceptance by writing 0 here. Left uninitialised,
+          // a driver that ignores the config leaves stack contents behind, and a
+          // stray 0 means "metering accepted": Remix then skips its own pacer and
+          // both presents leave back to back with nothing metering their display.
+          presentMetering.presentConfigFeedback = kPresentMeteringUntouched;
           pacerSemaphoreValue = kPacerDoNotWait;
         }
 
         // present the first interpolated frame
         // if we're using CPU pacing, this frame is presented immediately;
         // if we're using hardware pacing, this present sends down the pacing info
-        if (!submitPresent(interpolatedSwapchainImages[0], present, kPacerDoNotWait, usePresentMetering ? &presentMetering : nullptr)) {
+        // Diagnostic: skipping the interpolated present leaves interpolation
+        // running but halves the number of presents per job. If the job time
+        // halves with it, the two presents are additive serial waits; if it does
+        // not, the job is bounded by something one present already waits on.
+        // Output is wrong while set -- the interpolated frame is never shown.
+        static const bool kSkipInterpolatedPresent = std::getenv("CS_REMIX_SKIP_INTERP_PRESENT") != nullptr;
+        if (!kSkipInterpolatedPresent &&
+            !submitPresent(interpolatedSwapchainImages[0], present, kPacerDoNotWait, usePresentMetering ? &presentMetering : nullptr)) {
           // got an error, bail until it's handled
           continue;
         }
+        present1End = std::chrono::steady_clock::now();
 
         if (usePresentMetering) {
           // if we tried present metering and it failed, fall back to CPU pacing
           if (presentMetering.presentConfigFeedback != 0) {
             usePresentMetering = false;
+          }
+          {
+            static uint32_t s_lastFeedback = ~0u - 1;
+            static uint32_t s_reports = 0;
+            if (presentMetering.presentConfigFeedback != s_lastFeedback && s_reports < 8) {
+              ++s_reports;
+              s_lastFeedback = presentMetering.presentConfigFeedback;
+              Logger::info(str::format("[RTX.metering] presentConfigFeedback=",
+                presentMetering.presentConfigFeedback == kPresentMeteringUntouched ? std::string("untouched-by-driver") : std::to_string(presentMetering.presentConfigFeedback),
+                " -> ", usePresentMetering ? "hardware metering" : "CPU pacer"));
+            }
           }
         }
 
@@ -791,6 +1069,10 @@ namespace dxvk {
         commandList->submit();
         commandList = nullptr;
 
+        if (kEarlyBackbufferRelease) {
+          releaseBackbuffer();
+        }
+
         // rendered frame present
         if (!submitPresent(renderedSwapchainImage, present, pacerSemaphoreValue, nullptr)) {
           // got an error, bail until it's handled
@@ -819,6 +1101,10 @@ namespace dxvk {
         commandList->endRecording();
         commandList->submit();
         commandList = nullptr;
+
+        if (kEarlyBackbufferRelease) {
+          releaseBackbuffer();
+        }
 
         // rendered frame present
         if (!submitPresent(renderedSwapchainImage, present, kPacerDoNotWait, nullptr)) {

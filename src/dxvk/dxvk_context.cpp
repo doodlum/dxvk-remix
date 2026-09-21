@@ -58,7 +58,26 @@ namespace dxvk {
   // NV-DXVK start: DLFG integration
   bool DxvkContext::isDLFGEnabled() const {
     ScopedCpuProfileZone();
-    return m_common->metaNGXContext().supportsDLFG() && DxvkDLFG::enable() && !m_common->metaDLFG().hasDLFGFailed();
+    const bool supported = m_common->metaNGXContext().supportsDLFG();
+    const bool optionEnabled = DxvkDLFG::enable();
+    const bool failed = m_common->metaDLFG().hasDLFGFailed();
+    // A successful DLFG support check logs nothing, so with frame generation
+    // silently inactive there is no way to tell which of the three terms is the
+    // one saying no. Reported once, and again whenever the answer changes.
+    static bool reported = false;
+    static bool lastSupported = false, lastOption = false, lastFailed = false;
+    if (!reported || supported != lastSupported || optionEnabled != lastOption || failed != lastFailed) {
+      reported = true;
+      lastSupported = supported;
+      lastOption = optionEnabled;
+      lastFailed = failed;
+      Logger::info(str::format("[RTX.dlfg] supported=", supported,
+        " rtx.dlfg.enable=", optionEnabled,
+        " failed=", failed,
+        " maxInterpolatedFrames=", m_common->metaNGXContext().dlfgMaxInterpolatedFrames(),
+        " reason='", m_common->metaDLFG().getDLFGNotSupportedReason(), "'"));
+    }
+    return supported && optionEnabled && !failed;
   }
 
   uint32_t DxvkContext::dlfgInterpolatedFrameCount() const {

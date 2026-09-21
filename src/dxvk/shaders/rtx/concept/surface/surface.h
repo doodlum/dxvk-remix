@@ -305,8 +305,15 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 1) : packedFlagUnset(data0b.z, 1 << 1); }
   }
 
-  // Bits 2-4 are spare. 5-7 describe geometry submitted through the Remix API;
+  // Bits 3-4 are spare. 2 and 5-7 describe geometry submitted through the Remix API;
   // RtSurface::writeGPUData writes them.
+
+  // Nine-float normal attribute: N, authored tangent, authored bitangent.
+  property bool nativeTangentFrame
+  {
+    get { return packedFlagGet(data0b.z, 1 << 2); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 2) : packedFlagUnset(data0b.z, 1 << 2); }
+  }
 
   // The normal attribute is a nine-float basis, not a normal: the columns of
   // the bind-pose to current-pose orientation, which the sampled normal is
@@ -319,7 +326,7 @@ struct Surface
 
   // Keep the supplied shading direction on both faces rather than bending it
   // into the hit hemisphere.
-  property bool preserveVertexNormals
+  property bool useFaceNormals
   {
     get { return packedFlagGet(data0b.z, 1 << 6); }
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 6) : packedFlagUnset(data0b.z, 1 << 6); }
@@ -546,6 +553,8 @@ struct MinimalSurfaceInteraction
 
 struct SurfaceInteraction : MinimalSurfaceInteraction
 {
+  // Flat world-space plane normal for transport through thin surfaces.
+  vec3 triangleNormal = 0.f;
 #ifdef GBUFFER_FEATURE_DEBUG_VIEW
 #if GBUFFER_FEATURE_DEBUG_VIEW
   vec3 debugTriangleNormal = 0.f;
@@ -561,6 +570,8 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec3 rawBitangent = 0.f;
   vec4 vertexColor = 0.0f;
   float triangleArea = 0.f;
+  float nativeEffectOpacity = 1.f;
+  float nativeEffectSoftOpacity = 1.f;
 
   // World-space columns of the orientation a model-space normal map is
   // authored against, interpolated across the hit. Identity unless the
@@ -568,6 +579,12 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec3 modelNormalX = vec3(1.f, 0.f, 0.f);
   vec3 modelNormalY = vec3(0.f, 1.f, 0.f);
   vec3 modelNormalZ = vec3(0.f, 0.f, 1.f);
+
+  // Unnormalised per-layer terrain weights, interpolated across the hit and
+  // normalised where they are used. Zero unless the surface says
+  // nativeLandscape.
+  float4 nativeLandscapeWeights0 = 0.f;
+  float2 nativeLandscapeWeights1 = 0.f;
 };
 
 struct GBufferMemoryMinimalSurfaceInteraction

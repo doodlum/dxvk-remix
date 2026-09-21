@@ -103,7 +103,8 @@ vec3 handleVisibilityVertex<let VisibilityMode : uint>(Ray ray, RayHitInfo rayHi
     const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial, true);
 
     const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
-      opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
+      // debugKnob.w=1 restores diffuse-modulated transmission for a process-local A/B.
+      opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction, cb.debugKnob.w != 1.0f);
 
     const bool isThinOpaqueSubsurface = (VisibilityMode & visibilityModeEnableSubsurfaceMaterials) && isThinOpaqueSubsurfaceMaterial(opaqueSurfaceMaterialInteraction);
 
@@ -123,29 +124,29 @@ vec3 handleVisibilityVertex<let VisibilityMode : uint>(Ray ray, RayHitInfo rayHi
     
     if (VisibilityMode & visibilityModeEnableSubsurfaceMaterials)
     {
+      if (usesNativeFoliageResponse(opaqueSurfaceMaterialInteraction))
+      {
+        // Extend the native back-facing response to coloured visibility through a leaf card.
+        // The triangle plane controls traversal; authored normals still control visible lighting.
+        const float angle = -abs(dot(ray.direction, surfaceInteraction.triangleNormal));
+        return saturate(nativeFoliageProjectedWeight(opaqueSurfaceMaterialInteraction, angle) * pi);
+      }
       const float normalDotOutputDirection = dot(-ray.direction, opaqueSurfaceMaterialInteraction.shadingNormal);
       if (normalDotOutputDirection < materialEpsilon)
       {
         return vec3(0.0f);
       }
-    
       const SubsurfaceMaterial subsurfaceMaterial = subsurfaceMaterialCreate(opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction);
-    
-      // Approximate the attenuation with assumption that input and output rays are on the same line and the volume is isotropic
       const float baseReflectivity = calcBt709Luminance(opaqueSurfaceMaterialInteraction.baseReflectivity);
-    
-      // Calculate path integral throughput/weight
-      // Note: The ray direction is in the outside medium. By reciprocity the entry and exit
-      // boundaries have the same Fresnel reflectance for this straight-through approximation.
+      // Entry and exit Fresnel are reciprocal for this straight-through approximation.
       const float outsideFresnel = evalTranslucentSchlickFresnel(baseReflectivity, normalDotOutputDirection);
       const float insideFresnel = evalTranslucentSchlickFresnel(baseReflectivity, normalDotOutputDirection);
       const float attenuationDistance = subsurfaceMaterial.measurementDistance * subsurfaceMaterial.measurementDistance;
-      const vec3 attenuation = evalBeerLambertAttenuation(subsurfaceMaterial.volumetricAttenuationCoefficient, attenuationDistance * rcp(float(normalDotOutputDirection)));
-    
+      const vec3 attenuation = evalBeerLambertAttenuation(subsurfaceMaterial.volumetricAttenuationCoefficient,
+        attenuationDistance * rcp(normalDotOutputDirection));
       return subsurfaceMaterial.singleScatteringAlbedo * (1.0f - outsideFresnel) * (1.0f - insideFresnel) *
-              safePositiveDivide((subsurfaceMaterial.volumetricAttenuationCoefficient * attenuationDistance),
-              normalDotOutputDirection, materialEpsilon) *
-              rcp(fourPi) * attenuation;
+        safePositiveDivide(subsurfaceMaterial.volumetricAttenuationCoefficient * attenuationDistance,
+          normalDotOutputDirection, materialEpsilon) * rcp(fourPi) * attenuation;
     }
   }
   else if ((VisibilityMode & visibilityModeEnableTranslucentMaterials) && polymorphicType == surfaceMaterialTypeTranslucent)
@@ -262,6 +263,9 @@ struct VisibilityResult {
   float hitDistance;
   bool hasOpaqueHit;
   bool hasPOMHit;
+  // NV-DXVK start: Direct visibility diagnostic identity.
+  uint blockerSurfaceIndex;
+  // NV-DXVK end
 };
 
 VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
@@ -279,6 +283,7 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
 
   VisibilityResult result;
   result.rayDirection = visibilityRay.direction;
+  result.blockerSurfaceIndex = SURFACE_INDEX_INVALID;
 
   const float originalTMax = visibilityRay.tMax;
 
@@ -376,6 +381,13 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
       }
       result.hitDistance = rayQuery.CommittedRayT();
       result.hasOpaqueHit = true;
+      // NV-DXVK start: Direct visibility diagnostic identity.
+      if (cb.debugView == DEBUG_VIEW_DIRECT_BLOCKER_SURFACE)
+      {
+        RAY_HIT_INFO_CREATE_RAY_QUERY_COMMITTED(blockerHit, rayQuery)
+        result.blockerSurfaceIndex = rayInteractionCreate(visibilityRay, blockerHit).surfaceIndex;
+      }
+      // NV-DXVK end
 
       // If we already went through a portal, add the path segment before the portal
       if (expectedRayPortalIndex == invalidRayPortalIndex)
@@ -498,6 +510,7 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
           result.rayDirection = visibilityRay.direction;
           result.hitDistance = visibilityRay.tMax; // TODO should refactor POM code to return?
           result.hasPOMHit = true;
+          result.blockerSurfaceIndex = SURFACE_INDEX_INVALID;
           return result;
         }
       }

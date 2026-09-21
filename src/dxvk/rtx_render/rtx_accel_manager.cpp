@@ -67,7 +67,7 @@ namespace dxvk {
 
     // Invalidate incremental rebuild cache
     m_cachedBuckets.clear();
-    m_instanceBucketIndex.clear();
+    ++m_bucketCacheGeneration;
     m_cachedDynamicBlasEntries.clear();
     resetUniqueDynamicBlasGroups();
     m_lastProcessedGeneration = UINT64_MAX;
@@ -84,12 +84,31 @@ namespace dxvk {
   }
 
   void AccelManager::removeInstanceFromBucketCache(RtInstance* instance) {
-    if (m_instanceBucketIndex.erase(instance) == 0) {
+    ++m_bucketCacheEvictionsThisFrame;
+    if (!instance->hasBucketCache(m_bucketCacheGeneration)) {
       return;
     }
+    const uint32_t bucketIndex = instance->getBucketCacheIndex();
+    instance->invalidateBucketCache();
+    ++m_bucketCacheCachedEvictionsThisFrame;
 
-    m_cachedBuckets.clear();
-    m_instanceBucketIndex.clear();
+    // Which meshes churn decides whether the cache can ever stay clean: the same
+    // hashes recurring every frame means something is being torn down and
+    // rebuilt needlessly, while ever-changing hashes are genuinely transient.
+    m_evictedMaterialHashes[instance->getMaterialHash()]++;
+    m_churningMaterials[instance->getMaterialHash()] = m_currentFrameForChurn;
+    if (instance->getBillboardCount() > 0) {
+      ++m_evictedBillboardInstances;
+    }
+
+    // Only this instance's bucket is invalidated. Riverwood destroys around 28
+    // instances a frame but only one of them is usually cached, and clearing
+    // the whole cache for that one left the incremental path permanently off:
+    // the buckets it would have kept are 97% clean frame to frame.
+    // The bucket's instance vector still holds this now-dangling pointer, so
+    // validation must treat a forced-dirty bucket as unreadable rather than
+    // scanning it.
+    m_forcedDirtyBuckets.insert(bucketIndex);
     m_lastProcessedGeneration = UINT64_MAX;
   }
 
@@ -427,8 +446,6 @@ namespace dxvk {
 
     cb->trackResource<DxvkAccess::Read>(indexBuffer);
     cb->trackResource<DxvkAccess::Read>(positionBuffer);
-
-    execBarriers.recordCommands(cb);
   }
 
   void AccelManager::mergeInstancesIntoBlas(Rc<DxvkContext> ctx, 
@@ -508,6 +525,15 @@ namespace dxvk {
     // each cached bucket.  A bucket is dirty if any of its instances was removed,
     // had a transform / material / geometry change, or if the BlasEntry was updated
     // this frame.  Otherwise the bucket is clean and can be fully restored from cache.
+    // Meshes that were torn down and rebuilt recently. Anything still churning
+    // is kept out of the merged buckets below, so one unstable mesh does not
+    // dirty a bucket holding a thousand stable ones.
+    m_currentFrameForChurn = currentFrame;
+    for (auto it = m_churningMaterials.begin(); it != m_churningMaterials.end(); ) {
+      it = (currentFrame - it->second > kChurnMemoryFrames) ? m_churningMaterials.erase(it) : std::next(it);
+    }
+
+
     const bool hasValidBucketCache = !m_cachedBuckets.empty();
     std::vector<bool> bucketDirty;
     bool anyBucketDirty = false;
@@ -519,36 +545,56 @@ namespace dxvk {
         bucketDirty.resize(m_cachedBuckets.size(), true);
         anyBucketDirty = true;
         m_ommBindPending = false;
+        m_forcedDirtyBuckets.clear();
       } else {
-        std::unordered_set<RtInstance*> currentInstanceSet(instances.begin(), instances.end());
         bucketDirty.resize(m_cachedBuckets.size(), false);
 
+        // Buckets that lost an instance since the last merge are dirty already,
+        // and their instance vectors still reference the destroyed instance.
+        // Marking them before the scan is what keeps that pointer from being
+        // dereferenced below.
+        for (const uint32_t forced : m_forcedDirtyBuckets) {
+          if (forced < bucketDirty.size()) {
+            bucketDirty[forced] = true;
+            anyBucketDirty = true;
+            ++m_dirtyReasonEvicted;
+          }
+        }
+        m_forcedDirtyBuckets.clear();
+
         for (uint32_t bi = 0; bi < m_cachedBuckets.size(); ++bi) {
+          if (bucketDirty[bi]) {
+            continue;
+          }
           const auto& cachedBucket = m_cachedBuckets[bi];
 
           if (cachedBucket.instances.size() != cachedBucket.instanceCacheIdentities.size()) {
             bucketDirty[bi] = true;
             anyBucketDirty = true;
+            ++m_dirtyReasonSizeMismatch;
             continue;
           }
 
           for (size_t ii = 0; ii < cachedBucket.instances.size(); ++ii) {
             RtInstance* inst = cachedBucket.instances[ii];
 
-            // Validity check MUST come first: if the cached instance is no longer
-            // in the live set (per-instance GC, or any path that bypasses the
-            // bucket-vector cleanup), the pointer is dangling and must not be
-            // dereferenced. Mark the bucket dirty so it gets rebuilt without
-            // touching the stale entry.
-            if (currentInstanceSet.find(inst) == currentInstanceSet.end()) {
-              bucketDirty[bi] = true;
-              anyBucketDirty = true;
-              break;
+            // An instance the host preserved this frame was not re-derived, so
+            // none of the things checked below can have changed: its cache
+            // identity, its dirty flag, its BlasEntry's update frame and its
+            // TLAS instance fields are all carried over. Most of a clean
+            // bucket is in this state, and walking it was pointer chasing for
+            // an answer already known. The exception is a preserved instance
+            // shifted into a moved rebasing origin: that rewrites the transform
+            // this merge bakes into the geometry, and it says so by dirtying the
+            // BLAS, exactly as a dynamic move does.
+            if (inst->surface.isPreservePath && !inst->isBlasDirty()) {
+              continue;
             }
 
             if (inst->getCacheIdentity() != cachedBucket.instanceCacheIdentities[ii]) {
               bucketDirty[bi] = true;
               anyBucketDirty = true;
+              ++m_dirtyReasonIdentity;
               break;
             }
 
@@ -566,6 +612,15 @@ namespace dxvk {
                 bucketKeyChanged) {
               bucketDirty[bi] = true;
               anyBucketDirty = true;
+              m_dirtyReasonBlasDirty += inst->isBlasDirty() ? 1u : 0u;
+              m_dirtyReasonBlasUpdated += (inst->getBlas()->frameLastUpdated == currentFrame) ? 1u : 0u;
+              m_dirtyReasonBucketKey += bucketKeyChanged ? 1u : 0u;
+              // Measured 2026-09-19: routing the mesh that dirtied the bucket to
+              // its own BLAS, the way destroyed-while-cached meshes are routed,
+              // does reduce dirty buckets from 4.1 to 2.2 of 6 -- but 213 meshes
+              // end up needing a dynamic BLAS every frame and that costs more
+              // than the buckets save. 35.8 -> 35.3 fps. Unlike the destruction
+              // churn, which is ~30 meshes, this set is too large to relocate.
               break;
             }
           }
@@ -575,6 +630,53 @@ namespace dxvk {
       // With no cached buckets, every bucket is built from scratch below, so
       // pending OMM binding invalidation is naturally consumed by the full pass.
       m_ommBindPending = false;
+    }
+
+    {
+      // How much the bucket cache actually saves. This merge dominates a CPU
+      // bound frame, so whether it is hitting decides where the work has to go.
+      static uint32_t reportSamples = 0;
+      static uint32_t dirtySum = 0, totalSum = 0, anyDirtyFrames = 0;
+      static uint32_t evictionSum = 0, cachedEvictionSum = 0;
+      uint32_t dirtyCount = 0;
+      for (size_t i = 0; i < bucketDirty.size(); ++i) {
+        dirtyCount += bucketDirty[i] ? 1u : 0u;
+      }
+      dirtySum += dirtyCount;
+      evictionSum += m_bucketCacheEvictionsThisFrame;
+      cachedEvictionSum += m_bucketCacheCachedEvictionsThisFrame;
+      m_bucketCacheEvictionsThisFrame = 0;
+      m_bucketCacheCachedEvictionsThisFrame = 0;
+      totalSum += uint32_t(m_cachedBuckets.size());
+      anyDirtyFrames += anyBucketDirty ? 1u : 0u;
+      if (++reportSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] blas buckets dirty ", dirtySum / 120.0, " of ",
+          totalSum / 120.0, " per frame, frames with any dirty ", anyDirtyFrames,
+          "/120, instances ", instances.size(), ", instance destructions ", evictionSum / 120.0,
+          "/frame (", cachedEvictionSum / 120.0, " of them cached)"));
+        std::vector<std::pair<XXH64_hash_t, uint32_t>> topEvicted(
+          m_evictedMaterialHashes.begin(), m_evictedMaterialHashes.end());
+        std::sort(topEvicted.begin(), topEvicted.end(),
+          [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string evictedReport;
+        for (size_t i = 0; i < topEvicted.size() && i < 8; ++i) {
+          evictedReport += str::format(" ", std::hex, topEvicted[i].first, std::dec,
+            "x", topEvicted[i].second / 120.0);
+        }
+        Logger::info(str::format("[CSRemix.CPU] evicted meshes ", m_evictedMaterialHashes.size(),
+          " distinct over 120 frames, billboards ", m_evictedBillboardInstances / 120.0,
+          "/frame, churn-routed ", m_churnRoutedInstances / 120.0, "/frame, top:", evictedReport));
+        Logger::info(str::format("[CSRemix.CPU] bucket dirty reasons per 120 frames: evicted ",
+          m_dirtyReasonEvicted, " identity ", m_dirtyReasonIdentity, " blasDirty ", m_dirtyReasonBlasDirty,
+          " blasUpdatedThisFrame ", m_dirtyReasonBlasUpdated, " bucketKey ", m_dirtyReasonBucketKey,
+          " sizeMismatch ", m_dirtyReasonSizeMismatch, "; churning materials ", m_churningMaterials.size()));
+        m_dirtyReasonEvicted = m_dirtyReasonIdentity = m_dirtyReasonBlasDirty = 0;
+        m_dirtyReasonBlasUpdated = m_dirtyReasonBucketKey = m_dirtyReasonSizeMismatch = 0;
+        m_evictedMaterialHashes.clear();
+        m_evictedBillboardInstances = 0;
+        m_churnRoutedInstances = 0;
+        dirtySum = totalSum = anyDirtyFrames = evictionSum = cachedEvictionSum = 0;
+      }
     }
 
     // Allocate the transform buffer
@@ -650,6 +752,27 @@ namespace dxvk {
     // Hash map for O(1) bucket lookup instead of O(buckets) linear search per instance
     std::unordered_map<BlasBucketKey, BlasBucket*, BlasBucketKeyHash> bucketMap;
 
+    // Entries whose source geometry buffers have already been barriered and tracked
+    // this frame. Many instances share one BlasEntry and the work is per-buffer.
+    std::unordered_set<const BlasEntry*> trackedBlasEntries;
+
+    // Reading an RtxOption takes a global mutex, so the values the BLAS routing
+    // below depends on are resolved once instead of several times per instance.
+    // With thousands of instances that lock traffic costs more than the
+    // classification it feeds.
+    const uint32_t minPrimsInDynamicBLAS = std::max(RtxOptions::minPrimsInDynamicBLAS(), 100u);
+    const uint32_t maxPrimsForMergedBLAS = RtxOptions::maxPrimsInMergedBLAS();
+    const bool minimizeBlasMerging = RtxOptions::minimizeBlasMerging();
+    const bool forceMergeAllMeshes = RtxOptions::forceMergeAllMeshes();
+    const bool opacityMicromapActive = opacityMicromapManager && opacityMicromapManager->isActive();
+
+    const auto mergeLoopStart = std::chrono::steady_clock::now();
+    m_mergeCleanSkips = 0;
+    m_mergeDirtyVisits = 0;
+    // Walking every instance to service the few hundred that changed is not what
+    // costs here: software prefetching the instance 8 ahead measured 4.48 ms
+    // against 4.55 ms without it. The time is the per-dirty-instance work below,
+    // so skipping the clean ones faster buys nothing.
     for (RtInstance* instance : instances) {
       if (instance->isHidden()) {
         continue;
@@ -686,14 +809,15 @@ namespace dxvk {
       // On the incremental path, skip instances that belong to a clean cached bucket.
       // Their surfaces and TLAS instances will be restored from cache after the loop.
       if (hasValidBucketCache) {
-        auto bucketIdxIt = m_instanceBucketIndex.find(instance);
-        if (bucketIdxIt != m_instanceBucketIndex.end() &&
-            bucketIdxIt->second < bucketDirty.size() &&
-            !bucketDirty[bucketIdxIt->second]) {
+        if (instance->hasBucketCache(m_bucketCacheGeneration) &&
+            instance->getBucketCacheIndex() < bucketDirty.size() &&
+            !bucketDirty[instance->getBucketCacheIndex()]) {
           // This instance is in a clean cached bucket — skip all per-instance work
           instance->clearBlasDirty();
+          ++m_mergeCleanSkips;
           continue;
         }
+        ++m_mergeDirtyVisits;
       }
 
       // Optimization: skip fillGeometryInfoFromBlasEntry when the BlasEntry geometry
@@ -703,9 +827,8 @@ namespace dxvk {
       const bool blasGeometryChanged = (blasEntry->frameLastUpdated == currentFrame);
       const bool billboardGeometryChanged = instance->isBillboardGeometryDirty();
       const bool usesSplitBillboardOmmGeometry =
+        opacityMicromapActive &&
         blasEntry->modifiedGeometryData.usesIndices() &&
-        opacityMicromapManager &&
-        opacityMicromapManager->isActive() &&
         OpacityMicromapManager::usesOpacityMicromap(*instance) &&
         OpacityMicromapManager::usesSplitBillboardOpacityMicromap(*instance);
       const uint32_t expectedGeometryCount = usesSplitBillboardOmmGeometry ? instance->getBillboardCount() : 1u;
@@ -718,24 +841,37 @@ namespace dxvk {
         fillGeometryInfoFromBlasEntry(*blasEntry, *instance, opacityMicromapManager);
       }
 
-      const uint32_t minPrimsInDynamicBLAS = std::max(RtxOptions::minPrimsInDynamicBLAS(), 100u);
-      const uint32_t maxPrimsForMergedBLAS = RtxOptions::maxPrimsInMergedBLAS();
       const uint32_t blasPrims = blasEntry->modifiedGeometryData.calculatePrimitiveCount();
 
       // Figure out if this blas should be a dynamic one
       const bool requestDynamicBlas = instance->surface.instancesToObject != nullptr ||    // Point instancer geometry is replicated many times in a scene, we want to reuse the BLAS memory for these objects
+                                      blasEntry->input.getGeometryData().nativeGrass ||    // Retained expanded grass refits; never rebuild it in a merged bucket.
                                       blasEntry->input.getSkinningState().numBones != 0 || // Skinned meshes are always desirable to give a dynamic BLAS, since we'll want to make use of BVH update for performance reasons
                                       blasEntry->getLinkedInstances().size() > 1  ||       // Meshes that are used in instances multiple times should benefit from BLAS reuse
                                       blasEntry->dynamicBlas != nullptr ||                 // If we already have a dynamic BLAS, keep using it.
                                       blasPrims > maxPrimsForMergedBLAS ||                 // Avoid large meshes ending up in the merged BLAS which is built every frame.  # prims is proportional to build cost.
-                                      RtxOptions::minimizeBlasMerging();                   // Option to attempt putting as many objects into dynamic BLAS as possible.
+                                      minimizeBlasMerging;                                 // Option to attempt putting as many objects into dynamic BLAS as possible.
 
       const bool forceMergedBlas = (blasEntry->buildGeometries.size() > 1 ||                                       // Currently we use multiple build geometries for particle billboards, which we prefer to merge into large BLAS
-                                    (!RtxOptions::minimizeBlasMerging() && blasPrims < minPrimsInDynamicBLAS) ||   // Avoid creating lots of small dynamic BLAS
-                                    RtxOptions::forceMergeAllMeshes()) &&                                          // Setting to force all meshes into the merged BLAS
-                                      instance->surface.instancesToObject == nullptr;                              // Never merge point instancer geometry
+                                    (!minimizeBlasMerging && blasPrims < minPrimsInDynamicBLAS) ||              // Avoid creating lots of small dynamic BLAS
+                                    forceMergeAllMeshes) &&                                                    // Setting to force all meshes into the merged BLAS
+                                      instance->surface.instancesToObject == nullptr &&                            // Never merge point instancer geometry
+                                      !blasEntry->input.getGeometryData().nativeGrass;                             // Grass keeps stable topology and previous vertex buffers.
 
-      if (requestDynamicBlas && !forceMergedBlas) {
+      // A mesh that is destroyed and recreated every frame can never be part of a
+      // clean merged bucket, and dirtying its bucket rebuilds every other mesh in
+      // it. Give it its own BLAS instead. Billboards and point instancers keep
+      // their existing routing because the merged path is load bearing for them.
+      const bool churningMesh =
+        !m_churningMaterials.empty() &&
+        blasEntry->buildGeometries.size() == 1 &&
+        instance->surface.instancesToObject == nullptr &&
+        m_churningMaterials.find(instance->getMaterialHash()) != m_churningMaterials.end();
+      if (churningMesh) {
+        ++m_churnRoutedInstances;
+      }
+
+      if ((requestDynamicBlas || churningMesh) && (!forceMergedBlas || churningMesh)) {
         // Since this loop is iterating over instances, and instances can share BLAS, we will build these later after identifying unique ones.
         auto uniqueBlasIter = m_uniqueDynamicBlasIndex.find(blasEntry);
         if (uniqueBlasIter == m_uniqueDynamicBlasIndex.end()) {
@@ -779,6 +915,7 @@ namespace dxvk {
         bucketKey.instanceFlags = instance->getVkInstance().flags;
         bucketKey.usesUnorderedApproximations = instance->usesUnorderedApproximations();
         bucketKey.isSubsurface = instance->isSubsurface();
+        bucketKey.isStatic = instance->surface.isPreservePath;
 
         bool merged = false;
         auto bucketIt = bucketMap.find(bucketKey);
@@ -786,7 +923,12 @@ namespace dxvk {
           merged = bucketIt->second->tryAddInstance(instance);
         }
 
-        // The instance couldn't be merged into any bucket - make a new one
+        // Measured 2026-09-19: capping a bucket at 256 instances, so a dirty one
+        // is cheap to rebuild, costs more than it saves -- 36.6 to 33.2 fps. An
+        // arbitrary split leaves unrelated meshes sharing a bucket, so the dirty
+        // rate does not fall in proportion to the extra BLAS builds. Grouping by
+        // something the game already knows moves as a unit, such as the owning
+        // TESObjectREFR, is the version of this idea worth trying.
         if (!merged) {
           auto newBucket = std::make_unique<BlasBucket>();
           merged = newBucket->tryAddInstance(instance);
@@ -796,12 +938,29 @@ namespace dxvk {
           blasBuckets.push_back(std::move(newBucket));
         }
 
-        // Track the lifetime and states of the source geometry buffers
-        trackBlasBuildResources(ctx, execBarriers, blasEntry);
+        // Track the lifetime and states of the source geometry buffers. Instances
+        // sharing a BlasEntry produce identical barriers and resource tracking, so
+        // only the first instance of each entry needs to do the work.
+        if (trackedBlasEntries.insert(blasEntry).second) {
+          trackBlasBuildResources(ctx, execBarriers, blasEntry);
+        }
+      }
+    }
+    {
+      static double loopTotal = 0.0;
+      static uint32_t loopSamples = 0;
+      loopTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - mergeLoopStart).count();
+      if (++loopSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] merge per-instance loop ", loopTotal / 120.0,
+          " ms/frame (mean of 120) over ", instances.size(), " instances (",
+          m_mergeCleanSkips, " skipped clean, ", m_mergeDirtyVisits, " processed)"));
+        loopTotal = 0.0;
       }
     }
 
     // Build/Update the dynamic BLAS
+    const auto dynamicBlasStart = std::chrono::steady_clock::now();
     for (uint32_t uniqueBlasIdx = 0; uniqueBlasIdx < m_uniqueDynamicBlasCount; ++uniqueBlasIdx) {
       const UniqueBlasInstances& uniqueBlasEntry = m_uniqueDynamicBlas[uniqueBlasIdx];
       BlasEntry* blasEntry = uniqueBlasEntry.blasEntry;
@@ -810,6 +969,11 @@ namespace dxvk {
       }
       assert(blasEntry->buildGeometries.size() == 1); // dynamic BLAS should always have this
       assert(blasEntry->buildRanges.size() == 1); // dynamic BLAS should always have this
+
+      // Standalone BLAS geometry is object-local; its TLAS instance supplies
+      // the transform. Cached build geometry may still name a merged bucket's
+      // per-frame transform slot after this entry changes routing.
+      blasEntry->buildGeometries[0].geometry.triangles.transformData.deviceAddress = 0;
 
       bool forceRebuild = false;
       XXH64_hash_t boundOpacityMicromapHash = kEmptyHash;
@@ -859,19 +1023,30 @@ namespace dxvk {
       buildInfo.geometryCount = 1;
       buildInfo.pGeometries = blasEntry->buildGeometries.data();
 
-      // Calculate the build sizes for this bucket
-      VkAccelerationStructureBuildSizesInfoKHR sizeInfo {};
-      sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-      m_device->vkd()->vkGetAccelerationStructureBuildSizesKHR(m_device->handle(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                                                               &buildInfo, &blasEntry->buildRanges[0].primitiveCount, &sizeInfo);
-
       // Try to reuse our dynamic BLAS if it exists
       Rc<PooledBlas>& selectedBlas = blasEntry->dynamicBlas;
 
-      bool build = forceRebuild || !selectedBlas.ptr() || selectedBlas->accelStructure->info().size != sizeInfo.accelerationStructureSize;
+      // A dynamic BLAS whose geometry did not change this frame is neither
+      // rebuilt nor refitted, and its build size cannot have changed either.
+      // vkGetAccelerationStructureBuildSizesKHR is a driver round trip, and this
+      // loop ran it for every dynamic BLAS in the scene -- 1,391 of them a frame
+      // here, which was the bulk of the loop's cost -- to compute a size that
+      // was then only used to confirm nothing had to happen.
+      const bool geometryChangedThisFrame = blasEntry->frameLastUpdated == currentFrame;
+      const bool mustQuerySize = forceRebuild || !selectedBlas.ptr() || geometryChangedThisFrame;
+
+      VkAccelerationStructureBuildSizesInfoKHR sizeInfo {};
+      sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+      if (mustQuerySize) {
+        m_device->vkd()->vkGetAccelerationStructureBuildSizesKHR(m_device->handle(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                                                 &buildInfo, &blasEntry->buildRanges[0].primitiveCount, &sizeInfo);
+      }
+
+      bool build = forceRebuild || !selectedBlas.ptr() ||
+                   (mustQuerySize && selectedBlas->accelStructure->info().size != sizeInfo.accelerationStructureSize);
 
       // Validate that the selected blas is compatible with the current build info for update purposes
-      bool update = blasEntry->frameLastUpdated == currentFrame;
+      bool update = geometryChangedThisFrame;
       if (update && !build && !validateUpdateMode(selectedBlas->buildInfo, buildInfo)) {
         // If an update is requested but the BLAS is not compatible with the current build info then force a rebuild
         update = false;
@@ -958,6 +1133,18 @@ namespace dxvk {
     // Clean cached buckets: restore surfaces + TLAS instances directly, touch BLAS.
     // Dirty/new buckets: their surfaces were already added by the main loop via
     // the bucket pipeline; their TLAS instances will be emitted by createBlasBuffersAndInstances.
+    {
+      static double dynTotal = 0.0;
+      static uint32_t dynSamples = 0;
+      dynTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - dynamicBlasStart).count();
+      if (++dynSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] merge dynamic BLAS loop ", dynTotal / 120.0,
+          " ms/frame (mean of 120), unique ", m_uniqueDynamicBlasCount));
+        dynTotal = 0.0;
+      }
+    }
+    const auto restoreStart = std::chrono::steady_clock::now();
     if (hasValidBucketCache) {
       for (uint32_t bi = 0; bi < m_cachedBuckets.size(); ++bi) {
         if (bucketDirty[bi]) {
@@ -1030,9 +1217,33 @@ namespace dxvk {
         "Downstream systems (NEE cache, prefix-sum lookups) may produce incorrect results.")));
     }
 
+    const auto buildBlasesStart = std::chrono::steady_clock::now();
+    {
+      static double restoreTotal = 0.0;
+      static uint32_t restoreSamples = 0;
+      restoreTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - restoreStart).count();
+      if (++restoreSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] merge restore+flatten+prefix ", restoreTotal / 120.0,
+          " ms/frame (mean of 120), surfaces ", m_reorderedSurfaces.size()));
+        restoreTotal = 0.0;
+      }
+    }
+
     buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager, 
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild,
                 instanceTransforms, totalScratchMemory);
+    {
+      static double buildTotal = 0.0;
+      static uint32_t buildSamples = 0;
+      buildTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - buildBlasesStart).count();
+      if (++buildSamples % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] buildBlases ", buildTotal / 120.0,
+          " ms/frame (mean of 120), buckets ", blasBuckets.size(), ", surfaces ", m_reorderedSurfaces.size()));
+        buildTotal = 0.0;
+      }
+    }
 
     // If new OMMs were built this frame, force a full scene rebuild next frame
     // so tryBindOpacityMicromap runs on all instances and the BLASes pick up the new OMMs.
@@ -1054,7 +1265,10 @@ namespace dxvk {
     {
       // Start with clean buckets from the previous cache
       std::vector<CachedBucketState> newCachedBuckets;
-      m_instanceBucketIndex.clear();
+      const auto cachePopulateStart = std::chrono::steady_clock::now();
+      // A new generation retires every index written last frame without touching
+      // the instances, so the clean buckets below can restamp only their own.
+      ++m_bucketCacheGeneration;
 
       if (hasValidBucketCache) {
         for (uint32_t bi = 0; bi < m_cachedBuckets.size(); ++bi) {
@@ -1062,7 +1276,7 @@ namespace dxvk {
             const uint32_t newIdx = static_cast<uint32_t>(newCachedBuckets.size());
             // Map instances to the new bucket index
             for (RtInstance* inst : m_cachedBuckets[bi].instances) {
-              m_instanceBucketIndex[inst] = newIdx;
+              inst->setBucketCache(m_bucketCacheGeneration, newIdx);
             }
             newCachedBuckets.push_back(std::move(m_cachedBuckets[bi]));
           }
@@ -1072,6 +1286,18 @@ namespace dxvk {
       // Add newly-built dirty buckets from this frame.  The PooledBlas was
       // recorded on each bucket by createBlasBuffersAndInstances.
       for (const auto& bucket : blasBuckets) {
+        // Caching a bucket means holding raw instance pointers across frames and
+        // relying on onInstanceDestroyed to evict them. InstanceManager skips
+        // that callback for renderer-created instances (view model and player
+        // clones), so a bucket holding one could be validated against a freed
+        // instance. Leave those buckets out of the cache and rebuild them.
+        const bool cacheable = std::none_of(
+          bucket->originalInstances.begin(), bucket->originalInstances.end(),
+          [](const RtInstance* inst) { return inst->isCreatedByRenderer(); });
+        if (!cacheable) {
+          continue;
+        }
+
         CachedBucketState cached;
 
         // Deduplicate instances list (billboard instances may repeat per build-geometry)
@@ -1114,13 +1340,24 @@ namespace dxvk {
 
         const uint32_t newIdx = static_cast<uint32_t>(newCachedBuckets.size());
         for (RtInstance* inst : cached.instances) {
-          m_instanceBucketIndex[inst] = newIdx;
+          inst->setBucketCache(m_bucketCacheGeneration, newIdx);
           inst->clearBlasDirty();
         }
         newCachedBuckets.push_back(std::move(cached));
       }
 
       m_cachedBuckets = std::move(newCachedBuckets);
+      {
+        static double popTotal = 0.0;
+        static uint32_t popSamples = 0;
+        popTotal += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - cachePopulateStart).count();
+        if (++popSamples % 120 == 0) {
+          Logger::info(str::format("[CSRemix.CPU] merge cache populate ", popTotal / 120.0,
+            " ms/frame (mean of 120), buckets ", m_cachedBuckets.size()));
+          popTotal = 0.0;
+        }
+      }
 
       // Update the dynamic BlasEntry set for the full-skip path
       m_cachedDynamicBlasEntries.clear();
@@ -1652,9 +1889,17 @@ namespace dxvk {
     std::size_t dataOffset = 0;
     surfacesGPUData.resize(surfacesGPUSize);
 
+    // Deliberately no "already packed" skip here, for the same reason the surface
+    // material write has none: an instance being preserved does not mean the
+    // bytes its surface packs to are unchanged. Animated materials rewrite their
+    // parameters in place behind a stable index, and skipping the pack froze
+    // them. Packing every surface is the honest thing to do until surfaces carry
+    // a revision of their own.
+
     for (uint32_t i = 0; i < m_reorderedSurfaces.size(); ++i) {
       const auto& currentInstance = *m_reorderedSurfaces[i];
       RtSurface& currentSurface = m_reorderedSurfaces[i]->surface;
+
 
       // For PointInstancer entries beyond the first, do nothing.  The GPU culling shader will 
       // patch per-instance transforms and set per-instance customInstanceIndex later.
@@ -1767,7 +2012,9 @@ namespace dxvk {
                                  size_t& totalScratchMemory) {
     ScopedGpuProfileZone(ctx, "buildBLAS");
     // Upload surfaces before opacity micromap generation which reads the surface data on the GPU
+    const auto uploadStart = std::chrono::steady_clock::now();
     uploadSurfaceData(ctx);
+    const auto ommStart = std::chrono::steady_clock::now();
 
     // Clear any stale OMM bindings from cached geometry data.  This must happen
     // unconditionally because buildGeometries are cached across frames and the
@@ -1798,7 +2045,22 @@ namespace dxvk {
     }
 
     // Blas buffers must be created after opacity micromaps were generated to calculate correct acceleration structure sizes
+    const auto createStart = std::chrono::steady_clock::now();
     createBlasBuffersAndInstances(ctx, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
+    {
+      static double up = 0.0, omm = 0.0, create = 0.0;
+      static uint32_t n = 0;
+      const auto now = std::chrono::steady_clock::now();
+      up += std::chrono::duration<double, std::milli>(ommStart - uploadStart).count();
+      omm += std::chrono::duration<double, std::milli>(createStart - ommStart).count();
+      create += std::chrono::duration<double, std::milli>(now - createStart).count();
+      if (++n % 120 == 0) {
+        Logger::info(str::format("[CSRemix.CPU] buildBlases phases: uploadSurfaceData ", up / 120.0,
+          " ms, omm ", omm / 120.0, " ms, createBlasBuffersAndInstances ", create / 120.0,
+          " ms (mean of 120), blasToBuild ", blasToBuild.size()));
+        up = omm = create = 0.0;
+      }
+    }
 
     // Make sure we have enough scratch memory for this build job
     if (totalScratchMemory > 0) {
@@ -1832,6 +2094,34 @@ namespace dxvk {
         blasRangesToBuild,
         m_transformBuffer != nullptr ? m_transformBuffer->getDeviceAddress() : 0,
         instanceTransforms);
+      // NV-DXVK start: BLAS rebuild volume counter
+      // Acceleration-structure rebuilds are resolution-independent, so they are
+      // the first suspect for frame cost that does not move with DLSS scaling.
+      {
+        static std::mutex blasRateMutex;
+        static std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+        static uint64_t frames = 0, fullBlas = 0, fullPrims = 0, refitBlas = 0, refitPrims = 0;
+        uint64_t frameFullBlas = 0, frameFullPrims = 0, frameRefitBlas = 0, frameRefitPrims = 0;
+        for (size_t i = 0; i < blasToBuild.size(); i++) {
+          const bool isRefit = blasToBuild[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+          const uint32_t p = blasRangesToBuild[i]->primitiveCount;
+          if (isRefit) { ++frameRefitBlas; frameRefitPrims += p; }
+          else { ++frameFullBlas; frameFullPrims += p; }
+        }
+        std::lock_guard lock(blasRateMutex);
+        ++frames;
+        fullBlas += frameFullBlas; fullPrims += frameFullPrims;
+        refitBlas += frameRefitBlas; refitPrims += frameRefitPrims;
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(now - windowStart).count();
+        if (elapsed >= 2.0 && frames) {
+          Logger::info(str::format("[RTX.blas] full ", fullBlas / frames, " blas / ",
+                                   fullPrims / frames, " prims | refit ", refitBlas / frames,
+                                   " blas / ", refitPrims / frames, " prims (per frame)"));
+          windowStart = now; frames = 0; fullBlas = 0; fullPrims = 0; refitBlas = 0; refitPrims = 0;
+        }
+      }
+      // NV-DXVK end
       ctx->vkCmdBuildAccelerationStructuresKHR(blasToBuild.size(), blasToBuild.data(), blasRangesToBuild.data());
 
       execBarriers.accessBuffer(

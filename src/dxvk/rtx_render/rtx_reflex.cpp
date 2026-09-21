@@ -19,6 +19,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <cstdlib>
 #include "rtx_reflex.h"
 #include "dxvk_device.h"
 
@@ -305,6 +306,17 @@ namespace dxvk {
     setMarker(frameId, VK_PRESENT_END);
   }
 
+  namespace {
+    // The out-of-band markers and queue notification are how the driver learns
+    // that the DLFG presents are frame-generation presents, and the driver paces
+    // those inside vkQueuePresentKHR with a timed sleep that occupies the present
+    // thread for ~frame/2 per present. Nothing in rtx.reflexMode reaches this:
+    // the markers fire whenever Reflex initialised, whatever the sleep mode.
+    // Skipping them lets the present return immediately and leaves spacing to
+    // the CPU pacer, which signals a GPU semaphore without blocking this thread.
+    const bool kSkipOutOfBandMarkers = std::getenv("CS_REMIX_NO_OOB_MARKERS") != nullptr;
+  }
+
   void RtxReflex::beginOutOfBandRendering(std::uint64_t frameId) const {
 #ifdef REFLEX_TRACY_MARKERS
     ScopedCpuProfileZoneDynamic(str::format("Begin Async Rendering ", frameId));
@@ -312,6 +324,9 @@ namespace dxvk {
 
     // Note: Reflex initialization not checked here as setMarker checks internally and needs to be called even when Reflex is not
     // initialized for PCL stats.
+    if (kSkipOutOfBandMarkers) {
+      return;
+    }
     setMarker(frameId, VK_OUT_OF_BAND_RENDERSUBMIT_START);
   }
 
@@ -322,6 +337,9 @@ namespace dxvk {
 
     // Note: Reflex initialization not checked here as setMarker checks internally and needs to be called even when Reflex is not
     // initialized for PCL stats.
+    if (kSkipOutOfBandMarkers) {
+      return;
+    }
     setMarker(frameId, VK_OUT_OF_BAND_RENDERSUBMIT_END);
   }
 
@@ -332,6 +350,9 @@ namespace dxvk {
 
     // Note: Reflex initialization not checked here as setMarker checks internally and needs to be called even when Reflex is not
     // initialized for PCL stats.
+    if (kSkipOutOfBandMarkers) {
+      return;
+    }
     setMarker(frameId, VK_OUT_OF_BAND_PRESENT_START);
   }
 
@@ -342,6 +363,9 @@ namespace dxvk {
 
     // Note: Reflex initialization not checked here as setMarker checks internally and needs to be called even when Reflex is not
     // initialized for PCL stats.
+    if (kSkipOutOfBandMarkers) {
+      return;
+    }
     setMarker(frameId, VK_OUT_OF_BAND_PRESENT_END);
   }
 
@@ -605,6 +629,9 @@ namespace dxvk {
     }
 
     // Note: This is marking that the queue in question is used for OOB presenting, not that it is a queue from a present queue family.
+    if (kSkipOutOfBandMarkers) {
+      return;
+    }
     NvLL_VK_NotifyOutOfBandQueue(m_device->handle(), queueHandle, VK_OUT_OF_BAND_QUEUE_TYPE_PRESENT);
   }
 }

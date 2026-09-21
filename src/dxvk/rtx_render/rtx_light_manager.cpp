@@ -448,11 +448,18 @@ namespace dxvk {
         ++range.count;
 
         // RTXDI needs a mapping from previous light idx to current (to deal with light list reordering)
-        if (light.getBufferIdx() != kNewLightIdx)
-          m_lightMappingData[m_currentActiveLightCount + light.getBufferIdx()] = (uint16_t)newBufferIdx;
+        // Note: the mapping array only spans last frame's indices, so a buffer index older than that -
+        // which any light that skipped a frame still carries - would write past its end. An external
+        // light does exactly that whenever the host stops submitting it for a frame and resumes, and
+        // the resulting heap overflow surfaces far from here as a corrupted allocation.
+        const uint32_t previousBufferIdx = light.getBufferIdx();
+        const bool previousIdxIsCurrent = previousBufferIdx != kNewLightIdx && previousBufferIdx < previousLightActiveCount;
+        if (previousIdxIsCurrent)
+          m_lightMappingData[m_currentActiveLightCount + previousBufferIdx] = (uint16_t)newBufferIdx;
 
-        // Also a mapping from current light idx to previous (for unbiased resampling)
-        m_lightMappingData[newBufferIdx] = light.getBufferIdx();
+        // Also a mapping from current light idx to previous (for unbiased resampling). A stale index
+        // names a slot in a buffer that no longer exists, so such a light reads as new.
+        m_lightMappingData[newBufferIdx] = previousIdxIsCurrent ? (uint16_t)previousBufferIdx : kNewLightIdx;
 
         // Record this light's stable identity indexed by its current buffer position (section A).
         // This lets a reservoir recover the light after renumbering, regardless of its age or

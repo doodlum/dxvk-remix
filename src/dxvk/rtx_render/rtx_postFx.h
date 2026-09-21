@@ -40,6 +40,9 @@ namespace dxvk {
     DxvkPostFx(DxvkDevice* device);
     ~DxvkPostFx();
 
+    void dispatchNativeRefraction(Rc<RtxContext> ctx, const Resources::RaytracingOutput& rtOutput);
+    RTX_OPTION("rtx.nativeRefraction", bool, debugMask, false, "Displays the native refraction normal, strength and coverage mask.");
+
     // Motion blur phase. Runs before tonemapping while the image is still in linear HDR space.
     // Reads m_finalOutput, writes back to m_finalOutput (via intermediate texture).
     void dispatchMotionBlur(
@@ -90,6 +93,7 @@ namespace dxvk {
   private:
     Rc<vk::DeviceFn> m_vkd;
     Rc<DxvkBuffer> m_highlightingValues;
+    Resources::Resource m_nativeRefractionMask;
 
     RTX_OPTION("rtx.postfx", bool,  enableMotionBlurNoiseSample, true, "Enable random distance sampling for every step along the motion vector. The random pattern is generated with interleaved gradient noise.");
     RTX_OPTION("rtx.postfx", bool,  enableMotionBlurEmissive, true, "Enable Motion Blur for Emissive surfaces. Disable this when the motion blur on emissive surfaces cause severe artifacts.");

@@ -381,6 +381,43 @@ namespace dxvk
     m_artificalWorldOffset += worldOffset;
   }
 
+  void RtCamera::rebasePreviousFrames(const Vector3& originDelta, bool includeCurrentFrame) {
+    const Vector3d delta { originDelta };
+
+    // A camera that has not been set up yet this frame still holds the previous
+    // frame's transform as its current one, and update() will rotate that into
+    // the previous slot, so it has to move with the rest.
+    if (includeCurrentFrame) {
+      m_matCache[MatrixType::ViewToWorld][3].xyz() -= delta;
+      m_matCache[MatrixType::WorldToView] = inverse(m_matCache[MatrixType::ViewToWorld]);
+      m_matCachef[MatrixType::WorldToView] = m_matCache[MatrixType::WorldToView];
+      if (m_isFreeCameraEnabled && m_type == CameraType::Main) {
+        m_matCache[MatrixType::FreeCamViewToWorld][3].xyz() -= delta;
+        m_matCache[MatrixType::FreeCamWorldToView] = inverse(m_matCache[MatrixType::FreeCamViewToWorld]);
+        m_matCachef[MatrixType::FreeCamWorldToView] = m_matCache[MatrixType::FreeCamWorldToView];
+      }
+    }
+
+    // Translated-world matrices are relative to the camera, and a change of
+    // world origin moves the camera and the world together, so they are already
+    // correct and are deliberately left alone.
+    m_matCache[MatrixType::PreviousViewToWorld][3].xyz() -= delta;
+    m_matCache[MatrixType::PreviousPreviousViewToWorld][3].xyz() -= delta;
+    m_matCache[MatrixType::UncorrectedPreviousViewToWorld][3].xyz() -= delta;
+    m_matCache[MatrixType::PreviousWorldToView] = inverse(m_matCache[MatrixType::PreviousViewToWorld]);
+    m_matCache[MatrixType::PreviousPreviousWorldToView] = inverse(m_matCache[MatrixType::PreviousPreviousViewToWorld]);
+
+    // The free camera matrices are only ever populated for the main camera with
+    // Remix's own free camera on; inverting them otherwise would be inverting
+    // whatever the cache was initialised to.
+    if (m_isFreeCameraEnabled && m_type == CameraType::Main) {
+      m_matCache[MatrixType::FreeCamPreviousViewToWorld][3].xyz() -= delta;
+      m_matCache[MatrixType::FreeCamPreviousPreviousViewToWorld][3].xyz() -= delta;
+      m_matCache[MatrixType::FreeCamPreviousWorldToView] = inverse(m_matCache[MatrixType::FreeCamPreviousViewToWorld]);
+      m_matCache[MatrixType::FreeCamPreviousPreviousWorldToView] = inverse(m_matCache[MatrixType::FreeCamPreviousPreviousViewToWorld]);
+    }
+  }
+
   Matrix4 getMatrixFromEulerAngles(float pitch, float yaw) {
     float cosPitch = cos(pitch);
     float sinPitch = sin(pitch);
@@ -805,6 +842,13 @@ namespace dxvk
   }
   
   Vector2 RtCamera::calcPixelJitter(uint32_t jitterFrameIdx) const {
+    // Startup-only native/RTX buffer diagnostic at identical pixel centres.
+    static const bool matchCaptureSamples = env::getEnvVar("CS_REMIX_TEST") == "1" &&
+      env::getEnvVar("CS_REMIX_MATCH_CAPTURE_SAMPLES") == "1";
+    if (matchCaptureSamples) {
+      return Vector2{ 0, 0 };
+    }
+
     // Only apply jittering when DLSS/XeSS/TAA is enabled, or if forced by settings
     if (!RtxOptions::isDLSSOrRayReconstructionEnabled() &&
         !RtxOptions::isXeSSEnabled() &&

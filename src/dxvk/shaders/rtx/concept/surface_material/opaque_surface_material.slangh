@@ -29,6 +29,12 @@ OpaqueSurfaceMaterial opaqueSurfaceMaterialCreate(MemoryPolymorphicSurfaceMateri
   if (visibilityCheckOnly)
   {
     OpaqueSurfaceMaterial opaqueSurfaceMaterial = reinterpret<OpaqueSurfaceMaterial>(memoryPolymorphicSurfaceMaterial);
+    // An effect's alpha needs its whole live palette and falloff block even in
+    // a visibility ray, and that block occupies the tail this path overwrites.
+    if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_EFFECT)
+    {
+      return opaqueSurfaceMaterial;
+    }
     opaqueSurfaceMaterial.emissiveColorTextureIndex = BINDING_INDEX_INVALID;
     opaqueSurfaceMaterial.roughnessTextureIndex = BINDING_INDEX_INVALID;
     opaqueSurfaceMaterial.metallicTextureIndex = BINDING_INDEX_INVALID;

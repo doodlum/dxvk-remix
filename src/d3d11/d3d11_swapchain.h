@@ -9,6 +9,9 @@
 #include "../util/sync/sync_signal.h"
 
 namespace dxvk {
+
+  // How many presents may be outstanding; see m_presentStatusSlots.
+  void setPresentsInFlight(uint32_t count);
   
   class D3D11Device;
   class D3D11DXGIDevice;
@@ -99,7 +102,21 @@ namespace dxvk {
     Rc<hud::Hud>              m_hud;
 
     D3D11Texture2D*           m_backBuffer = nullptr;
-    DxvkSubmitStatus          m_presentStatus;
+    // Two slots so a second frame can be in flight. With one, the main thread
+    // waits in SynchronizePresent for the previous frame's submission before it
+    // may start the next, which serialises the host's scene capture against the
+    // command-stream thread that consumes it -- together they are the frame.
+    // Allowing one more in flight lets the capture for the next frame overlap
+    // the work the last one queued. Depth is chosen by dxvkSetSyncPresent.
+    static constexpr uint32_t kMaxPresentsInFlight = 2;
+    DxvkSubmitStatus          m_presentStatusSlots[kMaxPresentsInFlight];
+    uint32_t                  m_presentSlot = 0;
+
+    // The frame-generation presenter runs its own present thread and does its
+    // own image acquisition, so the serialisation below is both unnecessary and
+    // actively harmful with it: it makes every rendered frame wait on the
+    // interpolated present that follows it.
+    bool                      m_usingDlfgPresenter = false;
 
     std::vector<Rc<DxvkImageView>> m_imageViews;
 
@@ -160,6 +177,8 @@ namespace dxvk {
             BOOL                      Vsync,
             VkPresentModeKHR*         pDstModes);
     
+    uint32_t PickDlfgImageCount(uint32_t base);
+
     uint32_t PickImageCount(
             UINT                      Preferred);
     

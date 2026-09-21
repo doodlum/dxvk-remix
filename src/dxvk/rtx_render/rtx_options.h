@@ -563,6 +563,11 @@ namespace dxvk {
                "example override: 'rtx.remixMenuKeyBinds = CTRL, SHIFT, Z'.\n"
                "Full list of key names available in `src/util/util_keybind.h`.");
 
+    RTX_OPTION("rtx", uint32_t, csExtraFrameLatency, 0,
+               "Extra frames the CPU may run ahead of the GPU in the D3D11 swapchain. "
+               "Raising this fills GPU bubbles when the frame is submission-bound, at the "
+               "cost of sampling animation further from when it is displayed.");
+
     RTX_OPTION_ARGS("rtx", DLSSProfile, qualityDLSS, DLSSProfile::Auto, "Adjusts internal DLSS scaling factor, trades quality for performance.",
                     args.environment = "RTX_QUALITY_DLSS",
                     args.flags = RtxOptionFlags::UserSetting);

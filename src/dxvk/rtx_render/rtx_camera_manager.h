@@ -54,6 +54,10 @@ namespace dxvk {
 
     void onFrameEnd();
 
+    // See RtCamera::rebasePreviousFrames. Applies to every camera that has been
+    // set up, since they all describe the same world.
+    void rebasePreviousFrames(const Vector3& originDelta, uint32_t frameId);
+
     // Calculates a camera type for the specified draw call.
     CameraType::Enum processCameraData(const DrawCallState& input);
     void processExternalCamera(CameraType::Enum type, const Matrix4& worldToView, const Matrix4& viewToProjection);

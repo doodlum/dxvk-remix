@@ -13,8 +13,8 @@ namespace dxvk {
     // callInjectRtx is false: the host composites before drawing its own UI
     // into the same backbuffer, so injecting at present would overwrite it.
     // Emitted onto the command-stream thread to order against queued draws.
-    m_context->EmitCs([backbuffer](DxvkContext* ctx) {
-      static_cast<RtxContext*>(ctx)->endFrame(0, backbuffer, false);
+    m_context->EmitCs([backbuffer, reflexFrameId = GetReflexFrameId()](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->endFrame(reflexFrameId, backbuffer, false);
     });
 
     m_drawCallId = 0;

@@ -56,4 +56,8 @@ struct SkinningArgs {
   uint useIndices;
   uint numBones;
   uint useOctahedralNormals;
+  uint modelSpaceNormals;
+  uint padding0;
+  uint padding1;
+  uint padding2;
 };

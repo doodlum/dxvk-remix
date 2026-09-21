@@ -74,6 +74,12 @@ namespace dxvk {
         {DEBUG_VIEW_IS_OPAQUE, "Is Opaque"},
         {DEBUG_VIEW_IS_THIN_OPAQUE, "Is Thin Opaque"},
         {DEBUG_VIEW_IS_SUBSURFACE_SCATTERING, "Is Subsurface Scattering (SSS)"},
+        {DEBUG_VIEW_THIN_SCATTERING_COLOR, "Thin Scattering Color"},
+        {DEBUG_VIEW_NATIVE_GRASS_KIND, "Native Grass Atlas Kind"},
+        {DEBUG_VIEW_DIRECT_VISIBILITY_STATE, "Direct Visibility: Invalid Red, Blocked Blue, Visible Green"},
+        {DEBUG_VIEW_DIRECT_BLOCKER_DISTANCE, "Direct Blocker Distance: Red <0.1, Yellow <1, Cyan <10, Blue Far"},
+        {DEBUG_VIEW_DIRECT_BLOCKER_SURFACE, "Direct Blocker: Same Surface Red, Other Blue, Visible Green"},
+        {DEBUG_VIEW_SHADING_NORMAL_FACING, "Shading Normal Facing: Away Red, Toward Green, Invalid Magenta"},
         {DEBUG_VIEW_IS_DIRECTION_ALTERED, "Is Direction Altered"},
         {DEBUG_VIEW_IS_EMISSIVE_BLEND, "Is Emissive Blend"},
         {DEBUG_VIEW_IS_EMISSIVE, "Is Emissive"},
@@ -1287,6 +1293,13 @@ namespace dxvk {
   }
 
   bool DebugView::shouldRunDispatchPostCompositePass() const {
+    if (debugViewIdx() == DEBUG_VIEW_PAIRED_SURFACE_FRAME ||
+        debugViewIdx() == DEBUG_VIEW_PAIRED_COMPOSITE_FRAME ||
+        debugViewIdx() == DEBUG_VIEW_PAIRED_MATERIAL_FRAME ||
+        debugViewIdx() == DEBUG_VIEW_PAIRED_ALPHA_COMPOSITE_FRAME ||
+        debugViewIdx() == DEBUG_VIEW_PAIRED_LIGHTING_FRAME) {
+      return false;
+    }
     return replaceCompositeOutput() || (debugViewIdx() == DEBUG_VIEW_DISABLED && RtxOptions::useDenoiserReferenceMode());
   }
 

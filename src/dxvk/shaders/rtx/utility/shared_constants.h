@@ -24,6 +24,10 @@
 
 // contains constants shared between shader and host code
 
+// NV-DXVK start: Shared host/shader material record stride.
+#define SURFACE_MATERIAL_GPU_SIZE 112
+// NV-DXVK end
+
 static const uint8_t surfaceMaterialTypeOpaque = uint8_t(0u);
 static const uint8_t surfaceMaterialTypeTranslucent = uint8_t(1u);
 static const uint8_t surfaceMaterialTypeRayPortal = uint8_t(2u);
@@ -44,16 +48,34 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 #define OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_EFFECT (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(13))
 // A host-imported albedo texture whose format claims linear but whose contents
 // are gamma encoded, so the hardware performs no conversion and the shader must.
-#define OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_SRGB_ALBEDO (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(14))
+// NV-DXVK start: Native colour metadata shares the packed 16-bit opaque flags.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_SRGB_ALBEDO (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(8))
+#ifdef __cplusplus
+static_assert((OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_SRGB_ALBEDO & 0xffffu) ==
+              OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_SRGB_ALBEDO);
+#endif
+// NV-DXVK end
 #define OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_IS_THIN_FILM_THICKNESS (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(1))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IGNORE_ALPHA_CHANNEL (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(2))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(3))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(4))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(5))
+#define OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_RGB_NORMAL (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(6))
+// NV-DXVK start: Native foliage colour inputs.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_FOLIAGE (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(7))
+#define NATIVE_FOLIAGE_GRASS 1u
+#define NATIVE_FOLIAGE_SOFT 2u
+#define NATIVE_FOLIAGE_BACK 4u
+#define NATIVE_FOLIAGE_NO_VERTEX_COLOR 8u
+#define NATIVE_FOLIAGE_OVERRIDE_COMPLEX 16u
+#define NATIVE_FOLIAGE_GAMMA_COLOR 32u
+#define NATIVE_FOLIAGE_SPHERE_NORMAL 64u
+// NV-DXVK end
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_THIN_FILM_LAYER (1 << 1)
+#define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_NATIVE_FOLIAGE (1 << 2)
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_GRASS_LIGHTING_PROXY (1 << 2)
 // flags overlap with type field when in gbuffer, which occupies last 2 bits.
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_MASK 0x3F

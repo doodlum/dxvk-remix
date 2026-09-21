@@ -59,6 +59,10 @@ struct PathState : IBasePayloadState
   // so they can be accumulated into in the path tracing loop.
   vec3 radiance;
   float _segmentHitDistance;
+  // NV-DXVK start: Absolute hardware T, separate from the current shading segment.
+  float resolveRayT;
+  bool continueOriginalRay;
+  // NV-DXVK end
 
   f16vec3 throughput;
   float16_t firstBounceHitDistance; // Note: The total hit distance of the resolve for the first bounce.

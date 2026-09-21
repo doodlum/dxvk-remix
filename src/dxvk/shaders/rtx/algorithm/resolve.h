@@ -68,6 +68,10 @@ interface IBasePayloadState
   property float3 origin { get; set; }
   property float coneRadius { get; set; }
   property float segmentHitDistance { get; set; }
+  // NV-DXVK start: Ordered transparency retains the hardware ray line.
+  property float resolveRayT { get; set; }
+  property bool continueOriginalRay { get; set; }
+  // NV-DXVK end
   property uint8_t rayMask { get; set; }
   property PortalSpace2BitsType portalSpace{ get; set; }
   property vec3 direction { get; set; }

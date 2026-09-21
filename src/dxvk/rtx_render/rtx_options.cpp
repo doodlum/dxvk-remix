@@ -587,6 +587,16 @@ namespace dxvk {
 
     // else Graphics Preset == Custom
     updateLightingSetting();
+
+    // The host has no other way to see what the preset actually resolved to, and
+    // "is this running at Remix's defaults" is otherwise unanswerable from a log.
+    Logger::info(str::format("[RTX.preset] resolved graphicsPreset=", (int) graphicsPreset(),
+      " (0 Ultra 1 High 2 Medium 3 Low 4 Custom) rtxdi=", useRTXDI(),
+      " rayReconstruction=", enableRayReconstruction(),
+      " neeCacheFirstBounce=", NeeCachePass::enable(),
+      " unorderedResolveInIndirectRays=", enableUnorderedResolveInIndirectRays(),
+      " postFx=", postFx.enable(),
+      " volumetrics=", device->getCommon()->metaGlobalVolumetrics().enable()));
   }
 
   void RtxOptions::updateRaytraceModePresets(const uint32_t vendorID, const VkDriverId driverID) {

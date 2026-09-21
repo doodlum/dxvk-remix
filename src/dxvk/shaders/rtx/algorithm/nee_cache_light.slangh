@@ -180,19 +180,23 @@ struct NEECacheUtils
     {
       OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
   #if USE_SIMPLIFIED_MODEL
-      // Don't override albedo textures because it may be used by some emissive objects
-      // opaqueSurfaceMaterial.albedoOpacityTextureIndex = BINDING_INDEX_INVALID;
-      opaqueSurfaceMaterial.normalTextureIndex = BINDING_INDEX_INVALID;
-      opaqueSurfaceMaterial.tangentTextureIndex = BINDING_INDEX_INVALID;
-      opaqueSurfaceMaterial.heightTextureIndex = BINDING_INDEX_INVALID;
-      opaqueSurfaceMaterial.roughnessTextureIndex = BINDING_INDEX_INVALID;
-      opaqueSurfaceMaterial.metallicTextureIndex = BINDING_INDEX_INVALID;
-      opaqueSurfaceMaterial.anisotropy = 1.0;
-      opaqueSurfaceMaterial.albedoOpacityConstant = 0.0;
-      opaqueSurfaceMaterial.roughnessConstant = 0.0;
-      opaqueSurfaceMaterial.metallicConstant = 0.0;
-      opaqueSurfaceMaterial.thinFilmThicknessConstant = 0.0;
-      opaqueSurfaceMaterial.flags = 0;
+      // NV-DXVK start: Preserve native effect inputs during emissive sampling.
+      // Native emission uses the tint, palette, alpha and flags together.
+      if (!(opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_EFFECT))
+      {
+        opaqueSurfaceMaterial.normalTextureIndex = BINDING_INDEX_INVALID;
+        opaqueSurfaceMaterial.tangentTextureIndex = BINDING_INDEX_INVALID;
+        opaqueSurfaceMaterial.heightTextureIndex = BINDING_INDEX_INVALID;
+        opaqueSurfaceMaterial.roughnessTextureIndex = BINDING_INDEX_INVALID;
+        opaqueSurfaceMaterial.metallicTextureIndex = BINDING_INDEX_INVALID;
+        opaqueSurfaceMaterial.anisotropy = 1.0;
+        opaqueSurfaceMaterial.albedoOpacityConstant = 0.0;
+        opaqueSurfaceMaterial.roughnessConstant = 0.0;
+        opaqueSurfaceMaterial.metallicConstant = 0.0;
+        opaqueSurfaceMaterial.thinFilmThicknessConstant = 0.0;
+        opaqueSurfaceMaterial.flags = 0;
+      }
+      // NV-DXVK end
   #endif
 
       const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =

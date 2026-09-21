@@ -573,6 +573,20 @@ namespace dxvk {
       displayMode.Width            = m_desc.Width;
       displayMode.Height           = m_desc.Height;
       displayMode.RefreshRate      = m_descFs.RefreshRate;
+      // The frame-generation present path paces to scanout regardless of the
+      // requested present mode, so each present costs one refresh interval and
+      // two presents per rendered frame put a hard ceiling at half the refresh
+      // rate. The game asks for the desktop rate; this asks for a specific one
+      // instead. It is an ordinary fullscreen mode request and reverts when the
+      // game exits.
+      if (const char* hz = std::getenv("CS_REMIX_REFRESH_HZ")) {
+        const uint32_t requested = uint32_t(std::max(0, atoi(hz)));
+        if (requested) {
+          displayMode.RefreshRate.Numerator = requested;
+          displayMode.RefreshRate.Denominator = 1;
+          Logger::info(str::format("DXGI: requesting ", requested, " Hz fullscreen mode"));
+        }
+      }
       displayMode.Format           = m_desc.Format;
       // Ignore these two, games usually use them wrong and we don't
       // support any scaling modes except UNSPECIFIED anyway.

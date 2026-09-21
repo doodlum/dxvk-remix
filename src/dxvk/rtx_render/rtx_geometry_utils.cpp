@@ -25,6 +25,7 @@
 #include "rtx_render/rtx_shader_manager.h"
 
 #include <rtx_shaders/gen_tri_list_index_buffer.h>
+#include <rtx_shaders/native_grass.h>
 #include <rtx_shaders/gpu_skinning.h>
 #include <rtx_shaders/view_model_correction.h>
 #include <rtx_shaders/bake_opacity_micromap.h>
@@ -34,12 +35,14 @@
 #include "dxvk_scoped_annotation.h"
 
 #include "rtx_context.h"
+#include "rtx_debug_view.h"
 #include "rtx_options.h"
 
 #include "rtx/pass/view_model/view_model_correction_binding_indices.h"
 #include "rtx/pass/opacity_micromap/bake_opacity_micromap_binding_indices.h"
 #include "rtx/pass/terrain_baking/decode_and_add_opacity_binding_indices.h"
 #include "rtx/pass/gpu_skinning_binding_indices.h"
+#include "rtx/pass/native_grass.h"
 #include "rtx/pass/skinning.h"
 #include "rtx/pass/smooth_normals_binding_indices.h"
 #include "rtx/pass/smooth_normals.h"
@@ -52,6 +55,18 @@ namespace dxvk {
 
   // Defined within an unnamed namespace to ensure unique definition across binary
   namespace {
+    class NativeGrassShader : public ManagedShader {
+      SHADER_SOURCE(NativeGrassShader, VK_SHADER_STAGE_COMPUTE_BIT, native_grass)
+      PUSH_CONSTANTS(NativeGrassArgs)
+      BEGIN_PARAMETER()
+        STRUCTURED_BUFFER(NATIVE_GRASS_VERTICES_INPUT)
+        STRUCTURED_BUFFER(NATIVE_GRASS_INDICES_INPUT)
+        STRUCTURED_BUFFER(NATIVE_GRASS_PLACEMENTS_INPUT)
+        RW_STRUCTURED_BUFFER(NATIVE_GRASS_VERTICES_OUTPUT)
+        RW_STRUCTURED_BUFFER(NATIVE_GRASS_INDICES_OUTPUT)
+      END_PARAMETER()
+    };
+
     class GenTriListIndicesShader : public ManagedShader {
       SHADER_SOURCE(GenTriListIndicesShader, VK_SHADER_STAGE_COMPUTE_BIT, gen_tri_list_index_buffer)
 
@@ -264,6 +279,321 @@ namespace dxvk {
     m_skinningContext = nullptr;
   }
 
+  bool RtxGeometryUtils::deformNativeGrass(Rc<DxvkContext> ctx, RasterGeometry& geometry,
+      NativeInstanceSet& placements, const Vector4& wind) {
+    static_assert(sizeof(remixapi_HardcodedVertex) == 64 && offsetof(remixapi_HardcodedVertex, color) == 32);
+    if (!geometry.nativeGrass || !placements.hasGrassPhases || placements.records.empty() ||
+        placements.grassRecords.size() != placements.records.size() ||
+        !geometry.positionBuffer.defined() || !geometry.indexBuffer.defined() ||
+        geometry.positionBuffer.stride() != sizeof(remixapi_HardcodedVertex) || geometry.positionBuffer.offsetFromSlice() != 0 ||
+        geometry.indexBuffer.indexType() != VK_INDEX_TYPE_UINT32)
+      return false;
+    const uint64_t vertexCount = uint64_t(geometry.vertexCount) * placements.records.size();
+    const uint64_t indexCount = uint64_t(geometry.indexCount) * placements.records.size();
+    const uint64_t maxRange = ctx->getDevice()->properties().core.properties.limits.maxStorageBufferRange;
+    if (!vertexCount || !indexCount || vertexCount * 36 > maxRange || indexCount * 4 > maxRange ||
+        placements.grassRecords.size() * sizeof(NativeGrassRecord) > maxRange)
+      return false;
+
+    const auto meshHash = geometry.hashes[HashComponents::Indices];
+    const bool initialize = placements.grassMeshHash != meshHash || placements.grassVertices == nullptr;
+    auto allocate = [&](uint64_t bytes, const char* name) {
+      DxvkBufferCreateInfo info {};
+      info.size = align(bytes, CACHE_LINE_SIZE);
+      info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+      info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      info.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+      return ctx->getDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, name);
+    };
+    if (placements.gpuRecords == nullptr) {
+      placements.gpuRecords = allocate(placements.grassRecords.size() * sizeof(NativeGrassRecord), "Native grass placements");
+      ctx->writeToBuffer(placements.gpuRecords, 0, placements.grassRecords.size() * sizeof(NativeGrassRecord), placements.grassRecords.data());
+    }
+    if (initialize) {
+      placements.grassVertices = allocate(vertexCount * 36, "Native grass deformed vertices");
+      placements.grassIndices = allocate(indexCount * 4, "Native grass expanded indices");
+      placements.grassBoundsMin = Vector3(FLT_MAX);
+      placements.grassBoundsMax = Vector3(-FLT_MAX);
+      for (const auto& record : placements.records) {
+        for (uint32_t corner = 0; corner < 8; ++corner) {
+          const Vector4 p = record.transform * Vector4(
+            (corner & 1) ? geometry.boundingBox.maxPos[0] : geometry.boundingBox.minPos[0],
+            (corner & 2) ? geometry.boundingBox.maxPos[1] : geometry.boundingBox.minPos[1],
+            (corner & 4) ? geometry.boundingBox.maxPos[2] : geometry.boundingBox.minPos[2], 1.f);
+          for (uint32_t axis = 0; axis < 3; ++axis) {
+            placements.grassBoundsMin[axis] = std::min(placements.grassBoundsMin[axis], p[axis]);
+            placements.grassBoundsMax[axis] = std::max(placements.grassBoundsMax[axis], p[axis]);
+          }
+        }
+      }
+      Logger::info(str::format("[CSRemix] native grass allocated placements=", placements.records.size(),
+        " vertices=", vertexCount, " indices=", indexCount));
+      placements.grassMeshHash = meshHash;
+    }
+    NativeGrassArgs args {};
+    args.vertexCount = geometry.vertexCount;
+    args.indexCount = geometry.indexCount;
+    args.instanceCount = uint32_t(placements.records.size());
+    // Measurement lever: the wind timer advances every frame, so the hash below
+    // never matches and every grass batch re-runs its deformation and rebuilds
+    // its BLAS every frame. Freezing the timer stops both and shows what that
+    // costs. Grass stops waving while it is set.
+    static const bool freezeGrass = std::getenv("CS_REMIX_FREEZE_GRASS") != nullptr;
+    if (geometry.nativeGrassHasWind && !freezeGrass) {
+      args.windX = wind.x; args.windY = wind.y; args.windZ = wind.z;
+      args.timer = (wind.x != 0 || wind.y != 0 || wind.z != 0) ? wind.w : 0.f;
+    }
+    const auto windHash = XXH64(&args, sizeof(args), meshHash);
+    if (initialize || placements.grassWindHash != windHash) {
+      ScopedGpuProfileZone(ctx, "NativeGrassWind");
+      args.writeIndices = initialize ? 1 : 0;
+      ctx->bindResourceBuffer(NATIVE_GRASS_VERTICES_INPUT, geometry.positionBuffer);
+      ctx->bindResourceBuffer(NATIVE_GRASS_INDICES_INPUT, geometry.indexBuffer);
+      ctx->bindResourceBuffer(NATIVE_GRASS_PLACEMENTS_INPUT, DxvkBufferSlice(placements.gpuRecords));
+      ctx->bindResourceBuffer(NATIVE_GRASS_VERTICES_OUTPUT, DxvkBufferSlice(placements.grassVertices));
+      ctx->bindResourceBuffer(NATIVE_GRASS_INDICES_OUTPUT, DxvkBufferSlice(placements.grassIndices));
+      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NativeGrassShader::getShader());
+      ctx->pushConstants(0, sizeof(args), &args);
+      const uint64_t threads = initialize ? std::max(vertexCount, indexCount) : vertexCount;
+      ctx->dispatch(uint32_t((threads + 127) / 128), 1, 1);
+      // The standard geometry cache copies these outputs and retains previous
+      // positions before AS refit. Order compute writes before both consumers.
+      ctx->emitMemoryBarrier(0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+      placements.grassWindHash = windHash;
+    }
+    // Opt-in, bounded validation: two asynchronous tiny readbacks, never a
+    // per-frame geometry readback. Compare actual GPU output to the native
+    // painted-weight formula and show that the same vertices really move.
+    static const bool validateWind = std::getenv("CS_REMIX_GRASS_PROBE") != nullptr;
+    if (validateWind) {
+      struct Probe {
+        Rc<DxvkBuffer> buffer;
+        NativeGrassRecord grassRecord;
+        NativeGrassArgs args {};
+        std::vector<Vector3> previous;
+        uint64_t key = 0;
+        uint32_t count = 0, frame = 0, samples = 0;
+        bool pending = false;
+      };
+      static Probe probe;
+      const uint32_t currentFrame = ctx->getDevice()->getCurrentFrameId();
+      if (probe.pending && currentFrame > probe.frame + 3 && !probe.buffer->isInUse(DxvkAccess::Write)) {
+        const auto* bytes = static_cast<const uint8_t*>(probe.buffer->mapPtr(0));
+        float maxError = 0, maxMotion = 0, maxNormalError = 0;
+        uint32_t attributeErrors = 0;
+        float phase;
+        std::memcpy(&phase, &probe.grassRecord.placement.padding[0], sizeof(phase));
+        const float angle = 0.4f * (phase + probe.args.timer);
+        const float wave = 0.3f * (std::sin(3.141592653589793f * std::sin(angle)) + std::sin(6.283185307179586f * std::sin(angle))) +
+          0.2f * std::cos(3.141592653589793f * std::cos(angle));
+        for (uint32_t i = 0; i < probe.count; ++i) {
+          remixapi_HardcodedVertex source {};
+          std::memcpy(&source, bytes + i * sizeof(source), sizeof(source));
+          float output[9];
+          std::memcpy(output, bytes + probe.count * sizeof(source) + i * 36, sizeof(output));
+          const auto base = probe.grassRecord.placement.transform * Vector4(source.position[0], source.position[1], source.position[2], 1.f);
+          const float weight = float(source.color >> 24) / 255.f;
+          const Vector3 expected(base.x + probe.args.windX * wave * weight * weight,
+            base.y + probe.args.windY * wave * weight * weight, base.z + probe.args.windZ * wave * weight * weight);
+          const Vector3 actual(output[0], output[1], output[2]);
+          for (uint32_t axis = 0; axis < 3; ++axis) {
+            if (!std::isfinite(actual[axis])) ++attributeErrors;
+            maxError = std::max(maxError, std::abs(actual[axis] - expected[axis]));
+            if (probe.samples) maxMotion = std::max(maxMotion, std::abs(actual[axis] - probe.previous[i][axis]));
+          }
+          Vector3 expectedNormal;
+          for (uint32_t axis = 0; axis < 3; ++axis) {
+            const auto& row = probe.grassRecord.normalRows[axis];
+            expectedNormal[axis] = row.x * source.normal[0] + row.y * source.normal[1] + row.z * source.normal[2];
+          }
+          if (!probe.grassRecord.placement.padding[1]) {
+            const float inverseLength = 1.f / std::sqrt(expectedNormal.x * expectedNormal.x +
+              expectedNormal.y * expectedNormal.y + expectedNormal.z * expectedNormal.z);
+            expectedNormal = expectedNormal * inverseLength;
+          }
+          for (uint32_t axis = 0; axis < 3; ++axis) {
+            if (!std::isfinite(output[axis + 3])) {
+              ++attributeErrors;
+            }
+            maxNormalError = std::max(maxNormalError, std::abs(output[axis + 3] - expectedNormal[axis]));
+          }
+          uint32_t color;
+          std::memcpy(&color, output + 8, sizeof(color));
+          attributeErrors += (color >> 24) != (source.color >> 24) || output[6] != source.texcoord[0] || output[7] != source.texcoord[1];
+          if (probe.samples == 0) probe.previous.push_back(actual);
+        }
+        Logger::info(str::format("[CSRemix] grass GPU probe sample=", probe.samples, " vertices=", probe.count,
+          " timer=", probe.args.timer, " maxPositionError=", maxError, " maxNormalError=", maxNormalError,
+          " maxMovement=", maxMotion, " nativeNormalRows=", probe.grassRecord.placement.padding[1], " attributeErrors=", attributeErrors));
+        probe.pending = false;
+        ++probe.samples;
+        if (probe.samples == 2) { probe.buffer = nullptr; probe.previous.clear(); }
+      }
+      const uint64_t key = placements.contentHash ^ meshHash;
+      if (geometry.nativeGrassHasWind && probe.samples < 2 && !probe.pending &&
+          (probe.key == 0 || (probe.key == key && std::abs(args.timer - probe.args.timer) > 1.f))) {
+        probe.key = key;
+        probe.count = std::min(geometry.vertexCount, 32u);
+        if (probe.buffer == nullptr) {
+          DxvkBufferCreateInfo info {};
+          info.size = align(uint64_t(probe.count) * (sizeof(remixapi_HardcodedVertex) + 36), CACHE_LINE_SIZE);
+          info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+          probe.buffer = ctx->getDevice()->createBuffer(info, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer, "Native grass bounded validation");
+        }
+        ctx->copyBuffer(probe.buffer, 0, geometry.positionBuffer.buffer(), geometry.positionBuffer.offset(), probe.count * sizeof(remixapi_HardcodedVertex));
+        ctx->copyBuffer(probe.buffer, probe.count * sizeof(remixapi_HardcodedVertex), placements.grassVertices, 0, probe.count * 36);
+        probe.grassRecord = placements.grassRecords.front();
+        probe.args = args;
+        probe.frame = currentFrame;
+        probe.pending = true;
+      }
+    }
+    const DxvkBufferSlice vertices(placements.grassVertices), indices(placements.grassIndices);
+    geometry.nativeGrassPrototypeTriangles = geometry.indexCount / 3;
+    geometry.vertexCount = uint32_t(vertexCount);
+    geometry.indexCount = uint32_t(indexCount);
+    geometry.positionBuffer = RasterBuffer(vertices, 0, 36, VK_FORMAT_R32G32B32_SFLOAT);
+    geometry.normalBuffer = RasterBuffer(vertices, 12, 36, VK_FORMAT_R32G32B32_SFLOAT);
+    geometry.texcoordBuffer = RasterBuffer(vertices, 24, 36, VK_FORMAT_R32G32_SFLOAT);
+    geometry.color0Buffer = RasterBuffer(vertices, 32, 36, VK_FORMAT_B8G8R8A8_UNORM);
+    geometry.indexBuffer = RasterBuffer(indices, 0, 4, VK_INDEX_TYPE_UINT32);
+    for (uint32_t axis = 0; axis < 3; ++axis) {
+      geometry.boundingBox.minPos[axis] = placements.grassBoundsMin[axis] - std::abs(wind[axis]);
+      geometry.boundingBox.maxPos[axis] = placements.grassBoundsMax[axis] + std::abs(wind[axis]);
+    }
+    // Topology identifies this retained placement revision, while position hash
+    // changes only with wind. This selects refit/history, not new meshes per frame.
+    geometry.hashes[HashComponents::Indices] = XXH64(&meshHash, sizeof(meshHash), placements.contentHash);
+    geometry.hashes[HashComponents::VertexPosition] = windHash;
+    geometry.hashes.precombine();
+    return true;
+  }
+
+  namespace {
+    struct SkinningProbe {
+      SkinningArgs args {};
+      std::array<DxvkBufferSlice, 6> slices;
+      std::array<VkDeviceSize, 6> offsets {};
+      Rc<DxvkBuffer> readback;
+      std::vector<Vector3> previous;
+      uint64_t key = 0, boneHash = 0, geometryKey = 0;
+      uint32_t frame = 0, count = 0, samples = 0;
+      bool queued = false, pending = false;
+    };
+
+    SkinningProbe& skinningProbeState() {
+      static SkinningProbe probe;
+      return probe;
+    }
+
+    bool skinningProbeEnabled() {
+      static const bool enabled = std::getenv("CS_REMIX_SKIN_PROBE") != nullptr;
+      return enabled;
+    }
+
+    bool faceSkinningProbeEnabled() {
+      static const bool enabled = std::getenv("CS_REMIX_FACE_SKIN_PROBE") != nullptr;
+      return enabled;
+    }
+
+    uint32_t faceProbeVertices() {
+      static const uint32_t count = []() -> uint32_t {
+        const auto* value = std::getenv("CS_REMIX_SKIN_PROBE_VERTICES");
+        if (!value) {
+          return 898;
+        }
+        char* end = nullptr;
+        const auto parsed = std::strtoul(value, &end, 10);
+        return end != value && !*end && parsed > 0 && parsed <= 4096 ? uint32_t(parsed) : 898u;
+      }();
+      return count;
+    }
+  }
+
+  void RtxGeometryUtils::probeSkinning(const Rc<DxvkContext>& ctx) {
+    if (!skinningProbeEnabled()) {
+      return;
+    }
+    auto& probe = skinningProbeState();
+    const auto frame = ctx->getDevice()->getCurrentFrameId();
+    if (probe.pending && frame > probe.frame + 3 && !probe.readback->isInUse(DxvkAccess::Write)) {
+      const auto* bytes = static_cast<const uint8_t*>(probe.readback->mapPtr(0));
+      const auto* positions = reinterpret_cast<const float*>(bytes + probe.offsets[0]);
+      const auto* normals = reinterpret_cast<const float*>(bytes + probe.offsets[1]);
+      const auto* weights = reinterpret_cast<const float*>(bytes + probe.offsets[2]);
+      const auto* indices = bytes + probe.offsets[3];
+      auto args = probe.args;
+      args.dstPositionOffset = args.dstPositionStride = args.dstNormalOffset = args.dstNormalStride = 0;
+      float maxPositionError = 0, maxNormalError = 0, maxMovement = 0;
+      uint32_t nonFinite = 0;
+      for (uint32_t i = 0; i < probe.count; ++i) {
+        float expectedPosition[3], expectedNormal[9];
+        skinning(i, expectedPosition, expectedNormal, positions, weights, indices, normals, args);
+        float actualPosition[3], actualNormal[9];
+        std::memcpy(actualPosition, bytes + probe.offsets[4] + i * probe.args.dstPositionStride, sizeof(actualPosition));
+        std::memcpy(actualNormal, bytes + probe.offsets[5] + i * probe.args.dstNormalStride, sizeof(actualNormal));
+        for (uint32_t axis = 0; axis < 3; ++axis) {
+          nonFinite += !std::isfinite(actualPosition[axis]) || !std::isfinite(expectedPosition[axis]);
+          maxPositionError = std::max(maxPositionError, std::abs(actualPosition[axis] - expectedPosition[axis]));
+          if (!probe.previous.empty()) {
+            maxMovement = std::max(maxMovement, std::abs(actualPosition[axis] - probe.previous[i][axis]));
+          }
+        }
+        for (uint32_t axis = 0; axis < 9; ++axis) {
+          nonFinite += !std::isfinite(actualNormal[axis]) || !std::isfinite(expectedNormal[axis]);
+          maxNormalError = std::max(maxNormalError, std::abs(actualNormal[axis] - expectedNormal[axis]));
+        }
+      }
+      probe.previous.resize(probe.count);
+      for (uint32_t i = 0; i < probe.count; ++i) {
+        std::memcpy(&probe.previous[i], bytes + probe.offsets[4] + i * probe.args.dstPositionStride, 3 * sizeof(float));
+      }
+      Logger::info(str::format("[CSRemix.skinProbe] sample=", probe.samples, " frame=", probe.frame,
+        " key=", probe.key, " boneHash=", probe.boneHash, " vertices=", probe.count,
+        " geometryKey=", probe.geometryKey,
+        " faceProbe=", faceSkinningProbeEnabled() ? 1 : 0,
+        " maxPositionError=", maxPositionError, " maxNormalError=", maxNormalError,
+        " maxMovement=", maxMovement, " nonFinite=", nonFinite));
+      probe.pending = false;
+      ++probe.samples;
+      if (probe.samples == (faceSkinningProbeEnabled() ? 64u : 12u)) {
+        probe.readback = nullptr;
+        probe.previous.clear();
+      }
+    }
+    if (probe.queued) {
+      VkDeviceSize size = 0;
+      for (uint32_t i = 0; i < probe.slices.size(); ++i) {
+        probe.offsets[i] = size;
+        size += align(probe.slices[i].length(), VkDeviceSize(16));
+      }
+      DxvkBufferCreateInfo info {};
+      info.size = size;
+      info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+      info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+      probe.readback = ctx->getDevice()->createBuffer(info,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "Bounded skinning validation");
+      for (uint32_t i = 0; i < probe.slices.size(); ++i) {
+        const auto& source = probe.slices[i];
+        ctx->copyBuffer(probe.readback, probe.offsets[i], source.buffer(), source.offset(), source.length());
+      }
+      probe.slices = {};
+      probe.queued = false;
+      probe.pending = true;
+    }
+  }
+
   void RtxGeometryUtils::dispatchSkinning(const DrawCallState& drawCallState,
                                           const RaytraceGeometry& geo) {
     const Rc<DxvkContext>& ctx = m_skinningContext;
@@ -306,9 +636,13 @@ namespace dxvk {
     params.useIndices = drawCallState.getGeometryData().blendIndicesBuffer.defined() ? 1 : 0;
     params.numBones = drawCallState.getGeometryData().numBonesPerVertex;
     params.useOctahedralNormals = normalVertexFormat == VK_FORMAT_R32_UINT ? 1 : 0;
+    // Both layouts carry three authored vectors through the GPU bone blend.
+    params.modelSpaceNormals = (drawCallState.getGeometryData().modelSpaceNormals ||
+      drawCallState.getGeometryData().nativeTangentFrame) ? 1 : 0;
+    assert(!params.modelSpaceNormals || !params.useOctahedralNormals);
 
     // If we don't have a mappable vertex buffer then we need to do this on the GPU
-    bool mustUseGPU = drawCallState.getGeometryData().positionBuffer.mapPtr() == nullptr;
+    bool mustUseGPU = params.modelSpaceNormals || drawCallState.getGeometryData().positionBuffer.mapPtr() == nullptr;
 
     // At some point, its more efficient to do these calculations on the GPU, this limit is somewhat arbitrary however, and might require better tuning...
     const uint32_t kNumVerticesToProcessOnCPU = 256;
@@ -359,16 +693,54 @@ namespace dxvk {
       params.dstNormalOffset = 0;
 
       float dstPosition[3];
-      float dstNormal[3];
+      float dstNormal[9];
+      const size_t normalBytes = sizeof(float) * (params.modelSpaceNormals ? 9 : params.useOctahedralNormals ? 1 : 3);
 
       for (uint32_t idx = 0; idx < params.numVertices; idx++) {
         skinning(idx, &dstPosition[0], &dstNormal[0], srcPosition, srcBlendWeight, srcBlendIndices, srcNormal, params);
 
         ctx->writeToBuffer(geo.positionBuffer.buffer(), geo.positionBuffer.offsetFromSlice() + idx * geo.positionBuffer.stride(), sizeof(dstPosition), &dstPosition[0]);
-        ctx->writeToBuffer(geo.normalBuffer.buffer(), geo.normalBuffer.offsetFromSlice() + idx * geo.normalBuffer.stride(), sizeof(dstNormal), &dstNormal[0]);
+        ctx->writeToBuffer(geo.normalBuffer.buffer(), geo.normalBuffer.offsetFromSlice() + idx * geo.normalBuffer.stride(), normalBytes, &dstNormal[0]);
       }
     }
     ++m_skinningCommands;
+    const bool faceProbe = faceSkinningProbeEnabled();
+    const auto targetVertices = faceProbeVertices();
+    const bool selectedFaceProbe = faceProbe && targetVertices != 898;
+    const auto totalBones = drawCallState.getSkinningState().numBones;
+    // Alternate facial classes are sampled only during the paired surface capture.
+    const bool probeArmed = !selectedFaceProbe || DebugView::debugViewIdx() == DEBUG_VIEW_PAIRED_SURFACE_FRAME;
+    if (skinningProbeEnabled() && params.modelSpaceNormals && params.useIndices &&
+        probeArmed && (selectedFaceProbe ? totalBones > 0 && totalBones <= 4 : totalBones == (faceProbe ? 2u : 24u)) &&
+        (!faceProbe || params.numVertices == targetVertices)) {
+      auto& probe = skinningProbeState();
+      const auto& input = drawCallState.getGeometryData();
+      // Imported morph meshes receive new synthetic topology hashes. Follow the
+      // selected vertex-count/material class, not an actor or mesh identity.
+      const auto key = faceProbe ? drawCallState.getMaterialData().getHash() :
+        input.hashes[HashComponents::VertexPosition];
+      if (probe.samples < (faceProbe ? 64u : 12u) && !probe.queued && !probe.pending && (!probe.key || probe.key == key)) {
+        probe.key = key;
+        probe.boneHash = drawCallState.getSkinningState().boneHash;
+        probe.geometryKey = input.getHashForRule<rules::TopologicalHash>();
+        probe.frame = ctx->getDevice()->getCurrentFrameId();
+        probe.count = std::min(params.numVertices, faceProbe ? targetVertices : 32u);
+        if (probe.count) {
+          auto span = [&](const auto& buffer, uint32_t components) {
+            // Geometry attributes have an additional offset within their slice.
+            return DxvkBufferSlice(buffer.buffer(), buffer.offset() + buffer.offsetFromSlice(),
+              VkDeviceSize(probe.count - 1) * buffer.stride() + components);
+          };
+          probe.slices = { span(input.positionBuffer, 12), span(input.normalBuffer, 36),
+            span(input.blendWeightBuffer, params.numBones * 4), span(input.blendIndicesBuffer, divCeil(params.numBones, 4u) * 4),
+            span(geo.positionBuffer, 12), span(geo.normalBuffer, 36) };
+          probe.args = params;
+          probe.args.srcPositionOffset = probe.args.srcNormalOffset = 0;
+          probe.args.blendWeightOffset = probe.args.blendIndicesOffset = 0;
+          probe.queued = true;
+        }
+      }
+    }
   }
 
   void RtxGeometryUtils::dispatchViewModelCorrection(
@@ -790,6 +1162,14 @@ namespace dxvk {
   }
 
   void RtxGeometryUtils::processGeometryBuffers(const RasterGeometry& input, RaytraceGeometry& output) {
+    // How the host wants these buffers read. Lost here, the normal buffer is
+    // decoded as a normal rather than a basis, and terrain never finds the
+    // per-vertex blend weights that follow its vertex colour.
+    output.modelSpaceNormals = input.modelSpaceNormals;
+    output.nativeTangentFrame = input.nativeTangentFrame;
+    output.useFaceNormals = input.useFaceNormals;
+    output.nativeLandscape = input.nativeLandscape;
+
     const DxvkBufferSlice slice = DxvkBufferSlice(output.historyBuffer[0]);
 
     output.positionBuffer = RaytraceBuffer(slice, input.positionBuffer.offsetFromSlice(), input.positionBuffer.stride(), input.positionBuffer.vertexFormat());

@@ -273,6 +273,57 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
 
   switch (cb.debugViewIdx)
   {
+  case DEBUG_VIEW_PAIRED_SURFACE_FRAME:
+  case DEBUG_VIEW_PAIRED_COMPOSITE_FRAME:
+  case DEBUG_VIEW_PAIRED_MATERIAL_FRAME:
+  case DEBUG_VIEW_PAIRED_ALPHA_COMPOSITE_FRAME:
+  case DEBUG_VIEW_PAIRED_LIGHTING_FRAME:
+  {
+    // All four panels read this dispatch's inputs, with no frame-cycling tiles.
+    const uvec2 doubled = uvec2(threadId) * 2u;
+    const uvec2 panel = doubled / cb.debugViewResolution;
+    const uvec2 sourcePixel = doubled % cb.debugViewResolution;
+    if (panel.y == 0u)
+    {
+      value = panel.x == 0u
+        ? RenderOutput[(sourcePixel * upscaledResolution) / cb.debugViewResolution]
+        : vec4(DebugView[sourcePixel].xyz, 1.0f);
+      if (panel.x == 1u && cb.debugViewIdx == DEBUG_VIEW_PAIRED_COMPOSITE_FRAME)
+      {
+        // Fixed diagnostic HDR compression, not the final image's tonemapper.
+        const vec3 hdr = max(Composite[sourcePixel].xyz, vec3(0.0f));
+        value = vec4(hdr / (vec3(1.0f) + hdr), 1.0f);
+      }
+    }
+    else if (panel.x == 0u)
+    {
+      const float depth = abs(PrimaryLinearViewZ[sourcePixel]);
+      value = vec4(vec3(depth / (depth + 100.0f)), 1.0f);
+      if (cb.debugViewIdx == DEBUG_VIEW_PAIRED_MATERIAL_FRAME)
+      {
+        value = unormVectorToColor(PrimaryVirtualWorldNormalPerceptualRoughness[sourcePixel].xyz);
+      }
+    }
+    else
+    {
+      const vec2 motion = PrimaryScreenSpaceMotionVector[sourcePixel];
+      value = vec4(saturate(vec2(0.5f) + motion * 0.05f), 0.0f, 1.0f);
+      if (cb.debugViewIdx == DEBUG_VIEW_PAIRED_MATERIAL_FRAME)
+      {
+        value = vec4(vec3(PrimaryVirtualWorldNormalPerceptualRoughness[sourcePixel].w), 1.0f);
+      }
+    }
+    if ((cb.debugViewIdx == DEBUG_VIEW_PAIRED_ALPHA_COMPOSITE_FRAME ||
+         cb.debugViewIdx == DEBUG_VIEW_PAIRED_LIGHTING_FRAME) && any(panel))
+    {
+      const vec3 terms = DebugView[sourcePixel].xyz;
+      const float term = panel.y == 0u ? terms.x : (panel.x == 0u ? terms.y : terms.z);
+      const float display = all(panel) && cb.debugViewIdx == DEBUG_VIEW_PAIRED_ALPHA_COMPOSITE_FRAME
+        ? saturate(term) : term / (1.0f + term);
+      value = vec4(vec3(display), 1.0f);
+    }
+    break;
+  }
   case DEBUG_VIEW_VIRTUAL_SHADING_NORMAL:
     value = unormVectorToColor(PrimaryVirtualWorldNormalPerceptualRoughness[threadId].xyz);
     break;
@@ -701,8 +752,19 @@ void main(uint2 threadId : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
     RNG randomState = createRNG(threadId, cb.frameIdx, 0);
     value = loadInput(randomState, threadId);
 
-    const bool storeInAccumulationBuffer = true;
-    value = accumulate(threadId, value, cb.accumulationArgs, storeInAccumulationBuffer, AccumulatedDebugView);
+    if (cb.debugViewIdx == DEBUG_VIEW_PAIRED_SURFACE_FRAME ||
+        cb.debugViewIdx == DEBUG_VIEW_PAIRED_COMPOSITE_FRAME ||
+        cb.debugViewIdx == DEBUG_VIEW_PAIRED_MATERIAL_FRAME ||
+        cb.debugViewIdx == DEBUG_VIEW_PAIRED_ALPHA_COMPOSITE_FRAME ||
+        cb.debugViewIdx == DEBUG_VIEW_PAIRED_LIGHTING_FRAME)
+    {
+      AccumulatedDebugView[threadId] = value;
+    }
+    else
+    {
+      const bool storeInAccumulationBuffer = true;
+      value = accumulate(threadId, value, cb.accumulationArgs, storeInAccumulationBuffer, AccumulatedDebugView);
+    }
   }
 
   storeDebugViewOutputStatistics(value, groupIndex);

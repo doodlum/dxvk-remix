@@ -70,6 +70,9 @@ namespace dxvk {
     static struct GpuPrint {
       friend class DebugView;
       RTX_OPTION("rtx.debugView.gpuPrint", bool, enable, false, "Enables writing into a GPU buffer that's read by CPU when CTRL is pressed. The value is printed to console.");
+      RTX_OPTION("rtx.debugView.gpuPrint", bool, requireCtrl, true, "Requires CTRL for GPU printing. Disable for automated selected-pixel diagnostics.");
+      RTX_OPTION("rtx.debugView.gpuPrint", int, nativeEffectFlags, -1, "Native effect probe filter: -1 matches all effects; otherwise matches the exact native effect flags word.");
+      RTX_OPTION("rtx.debugView.gpuPrint", int, nativeEffectPhase, -1, "Native effect probe: -1 cycles; 0 bindings, 1 source RGBA, 2 resolved RGBA, 3 UV, 4 vertex RGBA, 5 alpha factors, 6 emitted radiance and opacity, 7 blend classification.");
       RTX_OPTION("rtx.debugView.gpuPrint", bool, useMousePosition, true, "Uses mouse position to select a pixel to GPU print for.");
       RTX_OPTION("rtx.debugView.gpuPrint", Vector2i, pixelIndex, Vector2i(INT32_MAX, INT32_MAX), "Pixel position to GPU print for. Requires useMousePosition to be turned off.");
     } gpuPrint;
@@ -137,6 +140,8 @@ namespace dxvk {
     bool m_enableInfNanView = true;
     int m_colorCodeRadius = 4;
     RTX_OPTION("rtx.debugView", bool, showFirstGBufferHit, false, "Show information of the first hit surface.\n");
+    RTX_OPTION("rtx.debugView", bool, foliageDiffuseTransmission, false,
+      "Diagnostic: includes reflected diffuse colour in native tree/leaf visibility transmission. Does not change grass or visible SSS shading.");
     RTX_OPTION("rtx.debugView", bool, enableInputQuantization, false,
                "Enables uniform-step input quantization on debug view input buffers.\n"
                "This is mostly useful for when debugging artifacts relating to quantization that may not be visible in a buffer due to higher precision formats in use.\n"

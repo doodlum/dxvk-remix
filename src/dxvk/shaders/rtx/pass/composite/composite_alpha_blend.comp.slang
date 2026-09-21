@@ -47,34 +47,33 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
   samplePixel[localIndex.y * 16 + localIndex.x] = 0xffffffff;
   GroupMemoryBarrierWithGroupSync();
 
-  // Early out for pixels outside the camera
-  if (any(thread_id >= cb.camera.resolution))
-  {
-    return;
-  }
+  // Edge lanes must participate in the workgroup's neighbor exchange barriers.
+  const bool inBounds = all(thread_id < cb.camera.resolution);
+  const uint2 pixel = min(thread_id, cb.camera.resolution - 1u);
 
-  const float primaryLinearViewZ = texelFetch(PrimaryLinearViewZ, thread_id.xy, 0).x;
+  const float primaryLinearViewZ = texelFetch(PrimaryLinearViewZ, pixel, 0).x;
   const bool primaryMiss = primaryLinearViewZ == cb.primaryDirectMissLinearViewZ;
-  const CameraDirections primaryRayDirections = cameraPixelCoordinateToDirection(cb.camera, thread_id.xy);
+  const CameraDirections primaryRayDirections = cameraPixelCoordinateToDirection(cb.camera, pixel);
   const vec3 viewPosition = cameraReconstructViewPosition(cb.camera, primaryRayDirections.viewDirection, primaryLinearViewZ);
   const float viewDistance = length(viewPosition);
   vec3 cameraPosition = cameraGetWorldPosition(cb.camera);
 
-  AlphaBlendSurface surface = AlphaBlendSurface.createFromPacked(AlphaBlendGBuffer[thread_id], cb.alphaBlendSurfacePackMult);
+  AlphaBlendSurface surface = AlphaBlendSurface.createFromPacked(AlphaBlendGBuffer[pixel], cb.alphaBlendSurfacePackMult);
   vec3 surfaceLight = 0;
   vec4 debugValue = 0;
   vec3 surfacePosition = cameraPosition + surface.hitT * primaryRayDirections.worldDirection;
-  if (surface.isValid())
+  // Invalid surfaces skip sampling, but not synchronization with active lanes.
+  const bool validSurface = inBounds && surface.isValid();
   {
     vec3 particleNormal = surface.normal;
 
     RNG randomState = createRNG(thread_id, cb.frameIdx, 4);
 
-    int2 centerPixel = thread_id;
+    int2 centerPixel = pixel;
     int2 neighborPixel = centerPixel;
     float radius = cb.stochasticAlphaBlendInitialSearchRadius;
     float closestDepth = 1e10;
-    bool found = false;
+    bool found = !validSurface;
 
     if (cb.stochasticAlphaBlendUseNeighborSearch)
     {
@@ -147,12 +146,15 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
           {
             neighborPixel = clamp(centerPixel.xy + offset * radius, 0, cb.camera.resolution - 1);
           }
+          neighborPixel = clamp(neighborPixel, int2(0), int2(cb.camera.resolution) - 1);
           radius = clamp(radius, 2, 200);
         }
+        // Finish shared reads before any lane publishes the next iteration.
+        GroupMemoryBarrierWithGroupSync();
       }
       centerPixel = neighborPixel;
 
-      if (found)
+      if (validSurface && found)
       {
         int2 neighborPixel = centerPixel;
         vec3 diffuseLight = 0;
@@ -194,5 +196,8 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
     }
   }
 
-  AlphaBlendRadiance[thread_id.xy] = vec4(surfaceLight * surface.color.a,1);
+  if (inBounds)
+  {
+    AlphaBlendRadiance[thread_id.xy] = vec4(validSurface ? surfaceLight * surface.color.a : vec3(0.0f), 1.0f);
+  }
 }

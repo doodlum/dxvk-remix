@@ -537,7 +537,9 @@ vec3 getBentNormal(vec3 geometryNormal, vec3 shadingNormal, vec3 viewDirection)
   // At grazing incidence, reduce the margin so the geometry normal itself
   // always remains a valid solution.
   const float minGeometryNormalDotReflection = min(kIncidentClearanceScale * geometryNormalDotIncident, kMaxReflectionClearanceCosine);
-  if (dot(geometryNormal, reflectedDirection) >= minGeometryNormalDotReflection)
+  // Reflection is invariant to the sign of the normal, but the BSDF hemisphere is not.
+  if (dot(shadingNormal, incidentDirection) > 0.0f &&
+      dot(geometryNormal, reflectedDirection) >= minGeometryNormalDotReflection)
   {
     return shadingNormal;
   }

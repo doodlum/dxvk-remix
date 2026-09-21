@@ -989,7 +989,8 @@ namespace dxvk {
       return;
     }
 
-    calculateNumTexelsPerMicroTriangle(*numTexelsPerMicroTriangle, instance, numTriangles);
+    calculateNumTexelsPerMicroTriangle(*numTexelsPerMicroTriangle, instance,
+      geometryData.nativeGrassPrototypeTriangles ? geometryData.nativeGrassPrototypeTriangles : numTriangles);
 
     // The calculation is complete
     if (numTexelsPerMicroTriangle->status != OmmResult::DependenciesUnavailable) {
@@ -1060,7 +1061,9 @@ namespace dxvk {
 
     // Filter by OMM settings
     {
-      useOpacityMicromap &= !instance.isAnimated() || OpacityMicromapOptions::BuildRequests::enableAnimatedInstances();
+      // Native grass has immutable cutout attributes despite animated positions.
+      useOpacityMicromap &= geometryData.nativeGrassPrototypeTriangles != 0 ||
+        !instance.isAnimated() || OpacityMicromapOptions::BuildRequests::enableAnimatedInstances();
       useOpacityMicromap &= !alphaState.isParticle || OpacityMicromapOptions::BuildRequests::enableParticles();
     }
 
@@ -1910,7 +1913,9 @@ namespace dxvk {
     const uint32_t opacityMicromapPerTriangleBufferSize = dxvk::util::ceilDivide(numMicroTrianglesPerTriangle * numOpacityMicromapBitsPerMicroTriangle, 8);
     const uint32_t opacityMicromapBufferSize = numTriangles * opacityMicromapPerTriangleBufferSize;
 
-    omm_validation_assert((usesSplitBillboardOpacityMicromap(instance) || numTriangles == instance.getBlas()->input.getGeometryData().calculatePrimitiveCount()) &&
+    omm_validation_assert((usesSplitBillboardOpacityMicromap(instance) ||
+                          numTriangles == instance.getBlas()->input.getGeometryData().nativeGrassPrototypeTriangles ||
+                          numTriangles == instance.getBlas()->input.getGeometryData().calculatePrimitiveCount()) &&
                           instance.getBlas()->input.getGeometryData().calculatePrimitiveCount() ==
                           instance.getBlas()->modifiedGeometryData.calculatePrimitiveCount() &&
                           "Number of triangles must match and be consistent");

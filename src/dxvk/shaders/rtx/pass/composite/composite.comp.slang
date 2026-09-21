@@ -292,6 +292,16 @@ vec3 loadPrimaryRadiance(
     (primaryCombinedDiffuseRadiance * primaryAlbedo +
      primaryCombinedSpecularRadiance * primarySpecularAlbedo / roughnessFactor) * primaryAttenuation;
 
+  // NV-DXVK start: Same-frame primary lobe contributions before fog and volumes.
+  if (cb.debugViewIdx == DEBUG_VIEW_PAIRED_LIGHTING_FRAME && !primaryMiss)
+  {
+    storeInDebugView(pixelCoordinate, vec3(
+      calcBt709Luminance(max(primaryCombinedDiffuseRadiance * primaryAlbedo * primaryAttenuation, vec3(0.0f))),
+      calcBt709Luminance(max(primaryCombinedSpecularRadiance * primarySpecularAlbedo * primaryAttenuation / roughnessFactor, vec3(0.0f))),
+      0.0f));
+  }
+  // NV-DXVK end
+
   if (cb.enableReSTIRGI)
   {
     float specularWeight = pow(perceptualRoughness, cb.pixelHighlightReuseStrength);
@@ -626,6 +636,12 @@ vec4 compositeResult(
   }
 
   // Load Input Radiance
+  // NV-DXVK start: Inactive and primary-miss pixels have no primary lobe contribution.
+  if (cb.debugViewIdx == DEBUG_VIEW_PAIRED_LIGHTING_FRAME)
+  {
+    storeInDebugView(pixelCoordinate, vec3(0.0f));
+  }
+  // NV-DXVK end
   loadInputRadiance(
     pixelCoordinate, geometryFlags, pixelIsActive,
     primaryAlbedo, primarySpecularAlbedo, primaryAttenuation,
@@ -633,6 +649,15 @@ vec4 compositeResult(
     perceptualRoughness, primaryMiss,
     sharedRadiance,
     remodulatedTotalPrimaryRadiance, remodulatedTotalSecondaryRadiance);
+
+  // NV-DXVK start: Secondary/shared signal is separate from the primary lobes.
+  if (cb.debugViewIdx == DEBUG_VIEW_PAIRED_LIGHTING_FRAME)
+  {
+    const vec2 primaryLobes = DebugView[pixelCoordinate].xy;
+    storeInDebugView(pixelCoordinate, vec3(primaryLobes,
+      calcBt709Luminance(max(remodulatedTotalSecondaryRadiance + sharedRadiance, vec3(0.0f)))));
+  }
+  // NV-DXVK end
 
   // Calculate volumetric lighting
   applyVolumetricLighting(
@@ -656,6 +681,14 @@ vec4 compositeResult(
   applyFog(viewDistance, radianceScale, radianceOutput);
 
   // Combine the alpha-blended foreground with the background before upscaling.
+  // NV-DXVK start: Same-frame alpha composition terms, including inactive pixels.
+  if (cb.debugViewIdx == DEBUG_VIEW_PAIRED_ALPHA_COMPOSITE_FRAME)
+  {
+    storeInDebugView(pixelCoordinate, vec3(
+      calcBt709Luminance(max(radianceOutput * backgroundAlpha, vec3(0.0f))),
+      calcBt709Luminance(max(alphaBlendOutput, vec3(0.0f))), backgroundAlpha));
+  }
+  // NV-DXVK end
   return vec4(radianceOutput * backgroundAlpha + alphaBlendOutput, 1.f);
 }
 

@@ -53,9 +53,17 @@ struct NativeInstanceRecord {
 };
 static_assert(sizeof(NativeInstanceRecord) == 80);
 
+struct NativeGrassRecord {
+  NativeInstanceRecord placement;
+  Vector4 normalRows[3];
+};
+static_assert(sizeof(NativeGrassRecord) == 128);
+static_assert(offsetof(NativeGrassRecord, normalRows) == 80);
+
 struct NativeInstanceSet {
   std::vector<Matrix4> transforms;
   std::vector<NativeInstanceRecord> records;
+  std::vector<NativeGrassRecord> grassRecords;
   uint64_t contentHash = 0;
   Rc<DxvkBuffer> gpuRecords;
   bool hasGrassPhases = false;
@@ -146,10 +154,11 @@ struct RtSurface {
     uint16_t flags0 = 0;
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
-    // Bits 2-4 are spare. 5-7 describe geometry submitted through the Remix
+    // Bits 3-4 are spare. 2 and 5-7 describe geometry submitted through the Remix
     // API and are read by Surface in surface.h.
     flags0 |= modelSpaceNormals ?     (1 << 5) : 0;
-    flags0 |= preserveVertexNormals ? (1 << 6) : 0;
+    flags0 |= nativeTangentFrame ?    (1 << 2) : 0;
+    flags0 |= useFaceNormals ? (1 << 6) : 0;
     flags0 |= nativeLandscape ?       (1 << 7) : 0;
 
     writeGPUHelper(data, offset, flags0);
@@ -355,7 +364,8 @@ struct RtSurface {
   VkFormat normalFormat = VK_FORMAT_UNDEFINED;
   // Mirrors of the geometry flags, written into flags0 above.
   bool modelSpaceNormals = false;
-  bool preserveVertexNormals = false;
+  bool nativeTangentFrame = false;
+  bool useFaceNormals = false;
   bool nativeLandscape = false;
 
   uint32_t texcoordBufferIndex = kSurfaceInvalidBufferIndex;
@@ -581,9 +591,7 @@ struct LegacyMaterialDefaults {
 
 // Surface Materials
 
-// Todo: Compute size directly from sizeof of GPU structure (by including it), for now computed by sum of members manually.
-// Blocked on float16 support on the c++ side.
-constexpr std::size_t kSurfaceMaterialGPUSize = 4 * 4 * 4;
+constexpr std::size_t kSurfaceMaterialGPUSize = SURFACE_MATERIAL_GPU_SIZE;
 // Note: 0xFFFF used for inactive texture index to indicate to the GPU that no texture is in use for a specific variable
 // (as some are optional). Also used for debugging to provide wildly out of range values in case one is not set.
 constexpr uint32_t kSurfaceMaterialInvalidTextureIndex = 0xFFFFu;
@@ -658,8 +666,22 @@ struct RtOpaqueSurfaceMaterial {
     // NOTE: We keep the most commonly used elements in the material close together near the beginning
     //       This hopefully reduces loads for cases like opacity detection.
 
+    if (m_nativeLandscapeSrgbMask) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_LANDSCAPE;
+    }
+
+    if (m_nativeEffect) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_EFFECT;
+    }
+
     if (m_nativeSrgbAlbedo) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_SRGB_ALBEDO;
+    }
+    if (m_nativeRgbNormal) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_RGB_NORMAL;
+    }
+    if (m_nativeFoliage) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_FOLIAGE;
     }
 
     if (m_isRaytracedRenderTarget) {
@@ -693,10 +715,17 @@ struct RtOpaqueSurfaceMaterial {
     writeGPUHelperExplicit<2>(data, offset, m_secondaryTextureIndex);
 
     // data[4 - 7]
-    writeGPUHelper(data, offset, glm::packHalf1x16(m_albedoOpacityConstant.x));
-    writeGPUHelper(data, offset, glm::packHalf1x16(m_albedoOpacityConstant.y));
-    writeGPUHelper(data, offset, glm::packHalf1x16(m_albedoOpacityConstant.z));
-    writeGPUHelper(data, offset, glm::packHalf1x16(m_albedoOpacityConstant.w));
+    // An effect carries its own tint and intensity, and they animate, so these
+    // three constants come from its live parameters rather than the material's.
+    // Taking the material's leaves the intensity at zero, which the effect
+    // shader multiplies its colour by -- a fire that renders as a black hole.
+    const auto effectParameter = [this](uint32_t index, float fallback) {
+      return m_nativeEffect ? m_nativeEffect->parameters[index] : fallback;
+    };
+    writeGPUHelper(data, offset, glm::packHalf1x16(effectParameter(4, m_albedoOpacityConstant.x)));
+    writeGPUHelper(data, offset, glm::packHalf1x16(effectParameter(5, m_albedoOpacityConstant.y)));
+    writeGPUHelper(data, offset, glm::packHalf1x16(effectParameter(6, m_albedoOpacityConstant.z)));
+    writeGPUHelper(data, offset, glm::packHalf1x16(effectParameter(7, m_albedoOpacityConstant.w)));
 
     // data[8 - 11]
     writeGPUHelper(data, offset, glm::packHalf1x16(displaceIn));
@@ -711,11 +740,11 @@ struct RtOpaqueSurfaceMaterial {
     writeGPUHelperExplicit<2>(data, offset, m_normalTextureIndex);
 
     // data[16 - 19]
-    writeGPUHelper(data, offset, glm::packHalf1x16(m_emissiveColorConstant.x));
-    writeGPUHelper(data, offset, glm::packHalf1x16(m_emissiveColorConstant.y));
-    writeGPUHelper(data, offset, glm::packHalf1x16(m_emissiveColorConstant.z));
+    writeGPUHelper(data, offset, glm::packHalf1x16(effectParameter(16, m_emissiveColorConstant.x)));
+    writeGPUHelper(data, offset, glm::packHalf1x16(effectParameter(17, m_emissiveColorConstant.y)));
+    writeGPUHelper(data, offset, glm::packHalf1x16(effectParameter(18, m_emissiveColorConstant.z)));
     assert(m_cachedEmissiveIntensity <= FLOAT16_MAX);
-    writeGPUHelper(data, offset, glm::packHalf1x16(m_cachedEmissiveIntensity));
+    writeGPUHelper(data, offset, glm::packHalf1x16(effectParameter(12, m_cachedEmissiveIntensity)));
 
     // data[20 - 23]
     writeGPUHelper(data, offset, glm::packHalf1x16(m_roughnessConstant));
@@ -729,7 +758,50 @@ struct RtOpaqueSurfaceMaterial {
     // data[26]
     writeGPUHelperExplicit<2>(data, offset, m_samplerFeedbackStamp);
 
-    writeGPUPadding<10>(data, offset);
+    // data[27-39] — the six albedo and six normal layers a host's terrain blends
+    // between, and which of them were sampled in gamma space. Together they
+    // consume the material exactly, leaving no padding to write. Zero on every
+    // other material, which the flag above tells the shader to ignore.
+    if (m_nativeEffect) {
+      // NativeEffectStorage starts at byte 64, after a prefix it does not
+      // claim. The common fields above stop short of that, so the gap is
+      // padded rather than filled with terrain layers the effect never reads.
+      writeGPUPadding<10>(data, offset);
+      const auto& p = m_nativeEffect->parameters;
+      for (uint32_t i = 0; i < 4; ++i) {
+        writeGPUHelper(data, offset, p[i]); // uvOffset, uvScale
+      }
+      for (uint32_t i = 8; i < 12; ++i) {
+        writeGPUHelper(data, offset, p[i]); // falloff
+      }
+      writeGPUHelper(data, offset, p[14]);  // softDepth
+      writeGPUHelper(data, offset, p[13]);  // propertyAlpha
+      writeGPUHelper(data, offset, glm::packHalf1x16(p[15])); // lightingInfluence
+      writeGPUHelper(data, offset, m_effectPalette);
+      writeGPUHelper(data, offset, m_effectSampler);
+      writeGPUHelper(data, offset, uint16_t(uint16_t(p[19]) | m_nativeEffect->srgbMask));
+      assert(offset - oldOffset == kSurfaceMaterialGPUSize);
+      return;
+    }
+
+    if (m_nativeFoliage) {
+      writeGPUPadding<10>(data, offset);
+      writeGPUHelper(data, offset, m_foliageSoftLight);
+      writeGPUHelper(data, offset, m_foliageBackLight);
+      writeGPUHelper(data, offset, m_nativeFoliage->flags);
+      for (const auto value : m_nativeFoliage->parameters) {
+        writeGPUHelper(data, offset, value);
+      }
+      writeGPUPadding<16>(data, offset);
+      assert(offset - oldOffset == kSurfaceMaterialGPUSize);
+      return;
+    }
+    for (const auto textureIndex : m_nativeLandscapeTextures) {
+      writeGPUHelperExplicit<2>(data, offset, textureIndex);
+    }
+    writeGPUHelperExplicit<2>(data, offset, m_nativeLandscapeSrgbMask);
+
+    writeGPUPadding<kSurfaceMaterialGPUSize - 76>(data, offset);
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -835,6 +907,41 @@ struct RtOpaqueSurfaceMaterial {
   // texture itself is already part of the identity.
   void setNativeSrgbAlbedo(bool value) { m_nativeSrgbAlbedo = value; }
   bool getNativeSrgbAlbedo() const { return m_nativeSrgbAlbedo; }
+  void setNativeFoliage(std::shared_ptr<const NativeFoliageMaterialData> foliage, uint16_t softLight, uint16_t backLight) {
+    m_nativeFoliage = std::move(foliage);
+    m_foliageSoftLight = softLight;
+    m_foliageBackLight = backLight;
+    updateCachedHash();
+  }
+  void setNativeRgbNormal(bool value) { m_nativeRgbNormal = value; updateCachedHash(); }
+
+  // The five albedo then five normal layers a host's terrain blends, and which
+  // albedo layers were sampled in gamma space. A nonzero mask is what marks the
+  // material as terrain, so a host that blends no layers stays ordinary.
+  // A host's animated effect. Its block shares the tail with the terrain
+  // layers, so a material is one or the other, never both.
+  void setNativeEffect(std::shared_ptr<const NativeEffectMaterialData> effect,
+                       uint16_t palette, uint16_t sampler) {
+    m_nativeEffect = std::move(effect);
+    m_effectPalette = palette;
+    m_effectSampler = sampler;
+    updateCachedHash();
+  }
+
+  bool hasNativeRefraction() const {
+    return m_nativeEffect && (uint32_t(m_nativeEffect->parameters[19]) & 512u) != 0;
+  }
+
+  void setNativeLandscape(const std::array<uint16_t, 10>& textures, uint16_t srgbMask) {
+    m_nativeLandscapeTextures = textures;
+    m_nativeLandscapeSrgbMask = uint16_t(0x8000u | srgbMask);
+    // The layers are part of the material's identity and are set after
+    // construction, so the hash the surface cache dedupes on has to be redone.
+    // Left stale, every terrain material sharing a base albedo collides and
+    // cells render with their neighbours' layers.
+    updateCachedHash();
+  }
+  bool getNativeLandscape() const { return m_nativeLandscapeSrgbMask != 0; }
 
   template<typename Fn>
   void forEachTextureIndex(Fn&& fn) const {
@@ -846,6 +953,10 @@ struct RtOpaqueSurfaceMaterial {
     fn(m_roughnessTextureIndex);
     fn(m_metallicTextureIndex);
     fn(m_emissiveColorTextureIndex);
+    if (m_nativeFoliage) {
+      fn(m_foliageSoftLight);
+      fn(m_foliageBackLight);
+    }
   }
 
 private:
@@ -854,7 +965,7 @@ private:
     // derived from the albedo texture's format, and that texture's index is
     // already hashed, so two materials that differ in it cannot collide.
     static_assert(
-      sizeof(*this) == 128,
+      sizeof(*this) == 192,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -884,6 +995,16 @@ private:
       uint32_t isHairCard;                // NOTE: uint32_t to avoid padding
       uint32_t samplerFeedbackStamp;      // NOTE: uint32_t to avoid padding
       uint32_t secondaryTextureIndex;
+      // Terrain layers. Two materials sharing a base albedo but blending
+      // different layers are different materials.
+      std::array<uint16_t, 10> nativeLandscapeTextureIndices;
+      uint32_t nativeLandscapeFlags;      // NOTE: uint32_t to avoid padding
+      // The same applies to a host's effect: its palette is its identity.
+      uint32_t nativeEffectIdentityLow;
+      uint32_t nativeEffectIdentityHigh;
+      uint32_t effectPalette;             // NOTE: uint32_t to avoid padding
+      uint32_t effectSampler;             // NOTE: uint32_t to avoid padding
+      uint32_t nativeRgbNormal;
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -914,8 +1035,20 @@ private:
       m_isHairCard,
       m_samplerFeedbackStamp,
       m_secondaryTextureIndex,
+      m_nativeLandscapeTextures,
+      m_nativeLandscapeSrgbMask,
+      uint32_t(m_nativeEffect ? m_nativeEffect->identity : 0ull),
+      uint32_t((m_nativeEffect ? m_nativeEffect->identity : 0ull) >> 32),
+      m_effectPalette,
+      m_effectSampler,
+      m_nativeRgbNormal,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
+    if (m_nativeFoliage) {
+      const std::array<uint64_t, 2> foliageHash { m_nativeFoliage->hash(),
+        uint64_t(m_foliageSoftLight) | (uint64_t(m_foliageBackLight) << 16) };
+      m_cachedHash = XXH64(foliageHash.data(), sizeof(foliageHash), m_cachedHash);
+    }
   }
 
   void updateCachedData() {
@@ -966,6 +1099,21 @@ private:
   // Set by a host that imported an albedo texture the game authored in gamma
   // space but stored in a format claiming linear, so the shader must convert.
   bool m_nativeSrgbAlbedo = false;
+  bool m_nativeRgbNormal = false;
+  std::shared_ptr<const NativeFoliageMaterialData> m_nativeFoliage;
+  uint16_t m_foliageSoftLight = BINDING_INDEX_INVALID;
+  uint16_t m_foliageBackLight = BINDING_INDEX_INVALID;
+
+  // Ten bindless indices: five extra albedo layers then five extra normal layers.
+  // bit per albedo layer saying it was sampled in gamma space. Set together by
+  // setNativeLandscape; the material flag follows from the mask being nonzero.
+  // A host's animated effect, sharing the tail with the terrain layers above.
+  std::shared_ptr<const NativeEffectMaterialData> m_nativeEffect;
+  uint16_t m_effectPalette = 0;
+  uint16_t m_effectSampler = 0;
+
+  std::array<uint16_t, 10> m_nativeLandscapeTextures {};
+  uint16_t m_nativeLandscapeSrgbMask = 0;
   bool m_isHairCard;
 
   uint16_t m_samplerFeedbackStamp;
@@ -1013,6 +1161,10 @@ struct RtTranslucentSurfaceMaterial {
       flags |= TRANSLUCENT_SURFACE_MATERIAL_FLAG_USE_DIFFUSE_LAYER;
     }
 
+    if (m_nativeWater) {
+      flags |= TRANSLUCENT_SURFACE_MATERIAL_FLAG_NATIVE_WATER;
+    }
+
     // data[0- 1]
     writeGPUHelper(data, offset, flags);
     writeGPUHelper(data, offset, glm::packHalf1x16(m_cachedBaseReflectivity));
@@ -1046,11 +1198,39 @@ struct RtTranslucentSurfaceMaterial {
     writeGPUHelper(data, offset, glm::packHalf1x16(m_emissiveColorConstant.y));
     writeGPUHelper(data, offset, glm::packHalf1x16(m_emissiveColorConstant.z));
 
-    // data[17]: samplerFeedbackStamp
+    // data[17-53]: a host's water. Zero on every other translucent material,
+    // which the flag above tells the shader to ignore. The order here has to
+    // match TranslucentSurfaceMaterial in surface_material.h exactly, because
+    // the shader recovers it with reinterpret<>.
+    const auto waterParameter = [this](uint32_t index) {
+      return m_nativeWater ? m_nativeWater->parameters[index] : 0.0f;
+    };
+    writeGPUHelperExplicit<2>(data, offset, m_nativeWaterNormals[0]);
+    writeGPUHelperExplicit<2>(data, offset, m_nativeWaterNormals[1]);
+    // scale[3], amplitude[3], scroll[6]
+    for (uint32_t i = 0; i < 12; ++i) {
+      writeGPUHelper(data, offset, glm::packHalf1x16(waterParameter(i)));
+    }
+    // Wading flag. The projected UV basis that follows starts at byte 64.
+    writeGPUHelperExplicit<2>(data, offset, uint16_t(waterParameter(25)));
+    // projected-to-authored UV basis, six floats
+    for (uint32_t i = 12; i < 18; ++i) {
+      writeGPUHelper(data, offset, waterParameter(i));
+    }
+    // cell[4] then the signed dimension
+    for (uint32_t i = 18; i < 23; ++i) {
+      writeGPUHelper(data, offset, glm::packHalf1x16(waterParameter(i)));
+    }
+    writeGPUHelperExplicit<2>(data, offset, m_nativeWaterNormals[2]);
+    writeGPUHelperExplicit<2>(data, offset, m_nativeWaterNormals[3]);
+    writeGPUHelperExplicit<2>(data, offset, m_nativeWaterFlowSampler);
+    writeGPUHelper(data, offset, waterParameter(23));
+
+    // data[54]: samplerFeedbackStamp
     writeGPUHelperExplicit<2>(data, offset, m_samplerFeedbackStamp);
 
-    // data[18 - 31]
-    writeGPUPadding<28>(data, offset);
+    // data[55]
+    writeGPUPadding<kSurfaceMaterialGPUSize - 110>(data, offset);
 
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
@@ -1071,6 +1251,16 @@ struct RtTranslucentSurfaceMaterial {
     return m_cachedHash;
   }
 
+  // Not constructor arguments: these describe a host's water, which the USD
+  // material model has no equivalent for.
+  void setNativeWater(std::shared_ptr<const NativeWaterMaterialData> water,
+                      const std::array<uint16_t, 4>& normals, uint16_t flowSampler) {
+    m_nativeWater = std::move(water);
+    m_nativeWaterNormals = normals;
+    m_nativeWaterFlowSampler = flowSampler;
+    updateCachedHash();
+  }
+
   template<typename Fn>
   void forEachTextureIndex(Fn&& fn) const {
     fn(m_normalTextureIndex);
@@ -1081,7 +1271,7 @@ struct RtTranslucentSurfaceMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 96,
+      sizeof(*this) == 128,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -1099,6 +1289,12 @@ private:
       uint32_t useDiffuseLayer; // NOTE: uint32_t to avoid padding
       uint32_t samplerIndex;
       uint32_t samplerFeedbackStamp; // NOTE: uint32_t to avoid padding
+      // A host's water is part of the material's identity. Left out, every water
+      // surface sharing a normal map collides in the surface-material cache.
+      uint32_t nativeWaterIdentityLow;  // NOTE: split to keep the struct 4-aligned
+      uint32_t nativeWaterIdentityHigh;
+      std::array<uint16_t, 4> nativeWaterNormals;
+      uint32_t nativeWaterFlowSampler; // NOTE: uint32_t to avoid padding
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -1117,6 +1313,10 @@ private:
       m_useDiffuseLayer,
       m_samplerIndex,
       m_samplerFeedbackStamp,
+      uint32_t(m_nativeWater ? m_nativeWater->identity : 0ull),
+      uint32_t((m_nativeWater ? m_nativeWater->identity : 0ull) >> 32),
+      m_nativeWaterNormals,
+      m_nativeWaterFlowSampler,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -1157,6 +1357,12 @@ private:
   float m_thinWallThickness;
   bool m_useDiffuseLayer;
   uint16_t m_samplerFeedbackStamp;
+
+  // A host's water. The four indices are normal2, normal3, the flow atlas and
+  // the flow normal; the sampler is the flow atlas' own, which clamps.
+  std::shared_ptr<const NativeWaterMaterialData> m_nativeWater;
+  std::array<uint16_t, 4> m_nativeWaterNormals {};
+  uint16_t m_nativeWaterFlowSampler = 0;
 
   XXH64_hash_t m_cachedHash;
 
@@ -1202,8 +1408,8 @@ struct RtRayPortalSurfaceMaterial {
     writeGPUHelperExplicit<2>(data, offset, m_samplerIndex);
     writeGPUHelperExplicit<2>(data, offset, m_samplerIndex2);
 
-    // data[8 - 31]
-    writeGPUPadding<48>(data, offset); // Note: Padding for unused space
+    // The extension buffer and ordinary material buffer share one record stride.
+    writeGPUPadding<kSurfaceMaterialGPUSize - 16>(data, offset);
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -1392,8 +1598,8 @@ struct RtSubsurfaceMaterial {
     // data[12]
     writeGPUHelper(data, offset, glm::packHalf1x16(m_subsurfaceMaxSampleRadius));
 
-    // data[13-31]
-    writeGPUPadding<38>(data, offset);
+    writeGPUPadding<kSurfaceMaterialGPUSize - 26>(data, offset);
+    assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
   bool operator==(const RtSubsurfaceMaterial& r) const {

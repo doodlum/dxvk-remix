@@ -108,4 +108,39 @@ exe = executable('test_f16tof32',  files('test_f16tof32.cpp'),  include_director
 test('test_f16tof32', exe, env: test_env)
 tests += exe
 
+exe = executable('test_skinning_basis', files('test_skinning_basis.cpp'), include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_skinning_basis', exe, env: test_env)
+tests += exe
+
+exe = executable('test_native_refraction', files('test_native_refraction.cpp'), include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_native_refraction', exe, env: test_env)
+tests += exe
+
+exe = executable('test_native_basis_vertex', files('test_native_basis_vertex.cpp'), include_directories : remix_api_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_native_basis_vertex', exe, env: test_env)
+tests += exe
+
+exe = executable('test_native_foliage', files('test_native_foliage.cpp'), include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_native_foliage', exe, env: test_env)
+tests += exe
+
+exe = executable('test_native_effect', files('test_native_effect.cpp'), include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_native_effect', exe, env: test_env)
+tests += exe
+
+exe = executable('test_retained_retirement', files('test_retained_retirement.cpp'),
+  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+retirement_test_env = environment({'MALLOC_PERTURB_': '0'})
+foreach external_dll : external_dll_paths
+  retirement_test_env.append('PATH', external_dll)
+endforeach
+retirement_test_env.append('PATH', nrc_dll_path, join_paths(usd_lib_path, 'bin'), join_paths(usd_lib_path, 'lib'))
+test('test_retained_retirement', exe, env: retirement_test_env)
+tests += exe
+
+exe = executable('test_material_layout', files('test_material_layout.cpp'),
+  include_directories : [test_include_path, remix_api_include_path], dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_material_layout', exe, env: retirement_test_env)
+tests += exe
+
 alias_target('unit_tests', tests)

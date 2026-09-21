@@ -43,6 +43,68 @@ f16vec3 translucentSurfaceMaterialInteractionResolveTransmittanceColor(f16vec3 t
 
 // Translucent Surface Material Interaction Functions
 
+
+float3 nativeWaterFlowSample(TranslucentSurfaceMaterial material, SurfaceInteraction interaction,
+    float2 cellUV, float2 patternUV, float2 shift, float speed, float phase) {
+  const float4 flow = float4(textures[nonuniformEXT(uint(material.nativeWaterFlowAtlas))].SampleLevel(
+    samplers[nonuniformEXT(uint(material.nativeWaterFlowSampler))], cellUV + shift, 0));
+  const float strength = sqrt(max(1.01 - flow.b, 0));
+  const float2 rotation = flow.rg * 2 - 1;
+  const float2 p = 64 * patternUV * strength;
+  const float2 rotated = float2(rotation.x * p.x - rotation.y * p.y, rotation.y * p.x + rotation.x * p.y);
+  const float2 uv = phase + rotated - float2(speed * (0.001 * material.nativeWaterTime) * flow.a, 0);
+  const float2 gradientX = float2(dot(material.nativeWaterU.xy, interaction.textureGradientX), dot(material.nativeWaterV.xy, interaction.textureGradientX));
+  const float2 gradientY = float2(dot(material.nativeWaterU.xy, interaction.textureGradientY), dot(material.nativeWaterV.xy, interaction.textureGradientY));
+  const float2 sample = float2(textures[nonuniformEXT(uint(material.nativeWaterFlowNormal))].SampleGrad(
+    samplers[nonuniformEXT(uint(material.samplerIndex))], uv,
+    gradientX * ((material.nativeWaterWading != 0 ? 32 : 64) * strength),
+    gradientY * ((material.nativeWaterWading != 0 ? 32 : 64) * strength)).xy);
+  return float3(sample, flow.b);
+}
+
+float3 nativeWaterNormalRead(TranslucentSurfaceMaterial material, SurfaceInteraction interaction) {
+  const float2 coordinates = interaction.textureCoordinates;
+  const uint16_t indices[3] = { material.normalTextureIndex, material.nativeWaterNormal2, material.nativeWaterNormal3 };
+  const float2 scroll[3] = { float2(material.nativeWaterScroll1), float2(material.nativeWaterScroll2), float2(material.nativeWaterScroll3) };
+  float3 normal = float3(0, 0, 1);
+  [unroll] for (uint i = 0; i < 3; ++i) {
+    const float scale = max(float(material.nativeWaterScale[i]), 1.0f);
+    interaction.textureCoordinates = coordinates / scale + scroll[i];
+    vec4 sample;
+    if (surfaceMaterialInteractionTextureReadHelper(indices[i], material.samplerIndex, interaction, sample, -log2(scale))) {
+      // Native Water VS/PS: layer zero is a perturbation around (0,0,1),
+      // other layers use signed XYZ. These are WORLD-space normals, not TBN.
+      normal += float(material.nativeWaterAmplitude[i]) * (float3(sample.xyz) * 2 - float3(1, 1, i == 0 ? 2 : 1));
+    }
+  }
+  const float dimension = abs(float(material.nativeWaterDimension));
+  if (dimension > 0 && material.nativeWaterFlowAtlas != BINDING_INDEX_INVALID && material.nativeWaterFlowNormal != BINDING_INDEX_INVALID) {
+    interaction.textureCoordinates = coordinates;
+    const float2 sourceUV = float2(dot(material.nativeWaterU, float3(coordinates, 1)), dot(material.nativeWaterV, float3(coordinates, 1)));
+    // Native WADING uses 0.1 atlas UV and 0.5 pattern UV per source UV.
+    // CS folds the independently updated water-manager origins into cell.xy/zw.
+    const bool wading = material.nativeWaterWading != 0;
+    const float2 cellUV = (float2(material.nativeWaterCell.xy) + sourceUV * (wading ? 0.1 * dimension : 1)) / dimension;
+    const float2 patternUV = float2(material.nativeWaterCell.zw) + sourceUV * (wading ? 0.5 : 1);
+    const float2 shift = float2(1.0 / (128 * dimension));
+    const float2 weight = 1 - abs(frac(cellUV * (64 * dimension)) * 2 - 1);
+    const float3 n0 = nativeWaterFlowSample(material, interaction, cellUV, patternUV, shift, 9.92, 0);
+    const float3 n1 = nativeWaterFlowSample(material, interaction, cellUV, patternUV, float2(0, shift.y), 10.64, 0.27);
+    const float3 n2 = nativeWaterFlowSample(material, interaction, cellUV, patternUV, float2(0, 0), 8, 0);
+    const float3 n3 = nativeWaterFlowSample(material, interaction, cellUV, patternUV, float2(shift.x, 0), 8.48, 0.62);
+    const float3 blended = weight.y * (weight.x * n2 + (1 - weight.x) * n3) +
+      (1 - weight.y) * (weight.x * n1 + (1 - weight.x) * n0);
+    const float2 denominator = sqrt(weight * weight + (1 - weight) * (1 - weight));
+    const float2 xy = (blended.xy - 0.5) / (denominator.x * denominator.y);
+    const float3 flowNormal = float3(xy, sqrt(max(1 - dot(xy, xy), 0)));
+    // Near-water authored flow; native depth attenuation/distant blending are
+    // still separate work. BLEND_NORMALS uses the atlas blue-channel weight.
+    normal = material.nativeWaterDimension < 0 ? lerp(normalize(normal), flowNormal, blended.z) : flowNormal;
+  }
+  return normalize(normal);
+}
+
+
 TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreate(
   TranslucentSurfaceMaterial translucentSurfaceMaterial,
   Surface surface,
@@ -59,7 +121,8 @@ TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreat
   vec4 emissiveColorSample;
 
   bool secondNormalLoaded = false;
-  if (cb.translucentMaterialArgs.animatedWaterEnable && surface.isAnimatedWater)
+  const bool nativeWater = (translucentSurfaceMaterial.flags & TRANSLUCENT_SURFACE_MATERIAL_FLAG_NATIVE_WATER) != 0;
+  if (!nativeWater && cb.translucentMaterialArgs.animatedWaterEnable && surface.isAnimatedWater)
   {
     vec2 uvSize, uvBias;
     calcSpritesheetValues(
@@ -86,7 +149,7 @@ TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreat
     surfaceInteraction.textureCoordinates = primaryUV;
   }
 
-  const bool normalLoaded = surfaceMaterialInteractionTextureReadHelper(translucentSurfaceMaterial.normalTextureIndex, translucentSurfaceMaterial.samplerIndex, surfaceInteraction, normalSample);
+  const bool normalLoaded = !nativeWater && surfaceMaterialInteractionTextureReadHelper(translucentSurfaceMaterial.normalTextureIndex, translucentSurfaceMaterial.samplerIndex, surfaceInteraction, normalSample);
   // Note: Premultiplied alpha should really be used here for the transmittance or diffuse color as without it "transparent" regions of the texture in the diffuse color case for
   // example may cause incorrect coloration on the edges of more opaque regions due to texture filtering. This is hard to ensure on the art pipeline side of things however.
   const bool transmittanceOrDiffuseLoaded = surfaceMaterialInteractionTextureReadHelper(translucentSurfaceMaterial.transmittanceOrDiffuseTextureIndex, translucentSurfaceMaterial.samplerIndex, surfaceInteraction, transmittanceOrDiffuseSample);
@@ -99,7 +162,14 @@ TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteractionCreat
 
   vec3 normal = surfaceInteraction.geometryNormal;
 
-  if (normalLoaded)
+  if (nativeWater)
+  {
+    // The three scrolling layers and the flow field are authored in world
+    // space, so this bypasses the tangent basis entirely.
+    normal = nativeWaterNormalRead(translucentSurfaceMaterial, surfaceInteraction);
+    if (surfaceInteraction.geometryNormal.z < 0) normal = -normal;
+  }
+  else if (normalLoaded)
   {
     // Note: Using f16 from texture to decode from is fine as the original texture is only 8 bits of precision.
     vec3 tangentNormal = unsignedOctahedralToHemisphereDirection(vec2(normalSample.xy), cb.translucentMaterialArgs.normalIntensity);

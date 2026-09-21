@@ -2,7 +2,25 @@
 #include "d3d11_device.h"
 #include "d3d11_swapchain.h"
 
+// NV-DXVK start: Remix UI in the host swap chain
+#include "../dxvk/imgui/dxvk_imgui.h"
+#include "../dxvk/rtx_render/rtx_dlfg.h"
+#include "../dxvk/rtx_render/rtx_options.h"
+#include "../dxvk/rtx_render/rtx_reflex.h"
+#include <cstdlib>
+// NV-DXVK end
+
 namespace dxvk {
+
+  // The D3D9 swap chain brackets the application's frame with Reflex simulation
+  // markers, sleeps in Present for Reflex low-latency mode, and pings the latency
+  // thread; the D3D11 port carried over only the render-submit and present
+  // markers on the queue thread. Without SIMULATION_START/END the driver has no
+  // true frame cadence and paces the DLFG out-of-band presents from the present
+  // markers, which bracket a paced enqueue: a closed loop that settles at half
+  // the achievable rate. Without sleep(), Reflex low-latency mode never runs.
+  // Opt-in until measured, because this game install is shared.
+  static const bool kD3D11ReflexSimulation = std::getenv("CS_REMIX_D3D11_REFLEX_SIM") != nullptr;
 
   static uint16_t MapGammaControlPoint(float x) {
     if (x < 0.0f) x = 0.0f;
@@ -60,7 +78,9 @@ namespace dxvk {
     // NV-DXVK start: API-only Remix host for D3D11
     ReleasePrimarySwapChain();
     // NV-DXVK end
-    m_device->waitForSubmission(&m_presentStatus);
+    for (auto& status : m_presentStatusSlots) {
+      m_device->waitForSubmission(&status);
+    }
     m_device->waitForIdle();
     
     if (m_backBuffer)
@@ -281,7 +301,34 @@ namespace dxvk {
   }
 
 
+  namespace {
+    // The frame has a floor that neither GPU load nor CS-thread work explains,
+    // so the main thread's own time in present is measured to find it.
+    double g_presentTotal = 0.0, g_syncTotal = 0.0, g_flushTotal = 0.0, g_acquireTotal = 0.0;
+    double g_blitTotal = 0.0, g_onPresentTotal = 0.0, g_submitTotal = 0.0;
+    double g_endFrameTotal = 0.0, g_latencyTotal = 0.0;
+    double g_reflexSleepTotal = 0.0;
+    uint32_t g_presentSamples = 0;
+    struct PhaseTimer {
+      double& sink;
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      ~PhaseTimer() {
+        sink += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start).count();
+      }
+    };
+  }
+
+  // NV-DXVK start: Serialize the single-acquire Vulkan presenter
+  void setPresentsInFlight(uint32_t count) {
+    // Keep the host export compatible; vk::Presenter owns one pending acquire.
+    Logger::info(str::format("[CSRemix] presents in flight requested ", count,
+      "; effective 1 (single-acquire Vulkan presenter)"));
+  }
+  // NV-DXVK end
+
   HRESULT D3D11SwapChain::PresentImage(UINT SyncInterval) {
+    PhaseTimer presentTimer { g_presentTotal };
     Com<ID3D11DeviceContext> deviceContext = nullptr;
     m_parent->GetImmediateContext(&deviceContext);
 
@@ -293,21 +340,37 @@ namespace dxvk {
     // and each advancing the frame leaves the camera never settling.
     const bool isPrimary = ClaimPrimarySwapChain();
 
+    // Simulation ends when the application calls Present: its own draw calls are
+    // mapped into Remix's scene here rather than rendered, so they count as
+    // simulation, and the DXVK submit thread carries the rendering markers.
+    auto& reflex = m_device->getCommon()->metaReflex();
+    if (kD3D11ReflexSimulation && isPrimary) {
+      reflex.setLatencyPingThread();
+      reflex.endSimulation(immediateContext->m_rtx.GetReflexFrameId());
+    }
+
     // Before the flush, not after: EndFrame queues the composite and the flush
     // submits it, so m_swapImage holds the traced frame when the blitter runs.
     if (isPrimary) {
+      PhaseTimer endFrameTimer { g_endFrameTotal };
       immediateContext->m_rtx.EndFrame(m_swapImage);
     }
     // NV-DXVK end
 
     // Flush pending rendering commands before
-    immediateContext->Flush();
+    {
+      PhaseTimer flushTimer { g_flushTotal };
+      immediateContext->Flush();
+    }
 
     // Bump our frame id.
     ++m_frameId;
     
     for (uint32_t i = 0; i < SyncInterval || i < 1; i++) {
-      SynchronizePresent();
+      {
+        PhaseTimer syncTimer { g_syncTotal };
+        SynchronizePresent();
+      }
 
       if (!m_presenter->hasSwapChain())
         return DXGI_STATUS_OCCLUDED;
@@ -318,7 +381,10 @@ namespace dxvk {
 
       uint32_t imageIndex = 0;
 
+      const auto acquireStart = std::chrono::steady_clock::now();
       VkResult status = m_presenter->acquireNextImage(sync, imageIndex);
+      g_acquireTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - acquireStart).count();
 
       while (status != VK_SUCCESS) {
         RecreateSwapChain(m_vsync);
@@ -335,34 +401,82 @@ namespace dxvk {
 
       // Resolve back buffer if it is multisampled. We
       // only have to do it only for the first frame.
+      const auto blitStart = std::chrono::steady_clock::now();
       m_context->beginRecording(
         m_device->createCommandList());
       
       m_blitter->presentImage(m_context.ptr(),
         m_imageViews.at(imageIndex), VkRect2D(),
         m_swapImageView, VkRect2D());
+      g_blitTotal += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - blitStart).count();
 
       if (m_hud != nullptr)
         m_hud->render(m_context, info.format, info.imageExtent);
+
+      // NV-DXVK start: Remix UI in the host swap chain
+      if (isPrimary) {
+        m_device->getCommon()->setWindowHandle(m_window);
+        m_device->getCommon()->getImgui().render(m_context, info.imageExtent, true);
+      }
+      // NV-DXVK end
       
       if (i + 1 >= SyncInterval)
         m_context->signal(m_frameLatencySignal, m_frameId);
 
       // NV-DXVK start: API-only Remix host for D3D11
       if (isPrimary) {
+        PhaseTimer onPresentTimer { g_onPresentTotal };
         immediateContext->m_rtx.OnPresent(m_imageViews.at(imageIndex)->image());
       }
       // NV-DXVK end
 
-      SubmitPresent(immediateContext, sync, i, imageIndex);
+      {
+        PhaseTimer submitTimer { g_submitTotal };
+        SubmitPresent(immediateContext, sync, i, imageIndex);
+      }
     }
 
     // NV-DXVK start: presentImage carries the Reflex frame ID and acquired image index
     // Prepare for the next frame, now that every consumer of this frame's ID has read it.
+    // Sleeping inside Present is how Reflex delays the application's next input
+    // sample toward the point the GPU can actually consume the frame.
+    if (kD3D11ReflexSimulation && isPrimary) {
+      PhaseTimer reflexSleepTimer { g_reflexSleepTotal };
+      reflex.sleep();
+    }
     immediateContext->m_rtx.IncrementReflexFrameId();
     // NV-DXVK end
+    // After Present the application begins its next frame's simulation.
+    if (kD3D11ReflexSimulation && isPrimary) {
+      reflex.beginSimulation(immediateContext->m_rtx.GetReflexFrameId());
+      reflex.latencyPing(immediateContext->m_rtx.GetReflexFrameId());
+    }
 
-    SyncFrameLatency();
+    // Pre-acquiring the next frame's image was tried here and does not work.
+    // Synchronously it only moves the same wait to the end of Present (measured
+    // acquire 0.00002 ms, preAcquire 28.96 ms) because the game thread is still
+    // inside Present either way. Asynchronously on a worker it races the DLFG
+    // presenter's backbuffer index and the scene stops being submitted entirely.
+    // Hiding this wait needs the capture/submit order to change, not an earlier
+    // acquire.
+
+    {
+      PhaseTimer latencyTimer { g_latencyTotal };
+      SyncFrameLatency();
+    }
+    if (++g_presentSamples % 120 == 0) {
+      Logger::info(str::format("[CSRemix.CPU] present ", g_presentTotal / 120.0,
+        " ms/frame (flush ", g_flushTotal / 120.0, ", syncPresent ", g_syncTotal / 120.0,
+        ", acquire ", g_acquireTotal / 120.0, ", blit ", g_blitTotal / 120.0,
+        ", onPresent ", g_onPresentTotal / 120.0, ", submitPresent ", g_submitTotal / 120.0,
+        ", endFrame ", g_endFrameTotal / 120.0, ", syncFrameLatency ", g_latencyTotal / 120.0,
+        ", reflexSleep ", g_reflexSleepTotal / 120.0,
+        ") mean of 120"));
+      g_presentTotal = g_syncTotal = g_flushTotal = g_acquireTotal = 0.0;
+      g_blitTotal = g_onPresentTotal = g_submitTotal = 0.0;
+      g_endFrameTotal = g_latencyTotal = g_reflexSleepTotal = 0.0;
+    }
     return S_OK;
   }
 
@@ -376,7 +490,7 @@ namespace dxvk {
 
     // Present from CS thread so that we don't
     // have to synchronize with it first.
-    m_presentStatus.result = VK_NOT_READY;
+    m_presentStatusSlots[m_presentSlot].result = VK_NOT_READY;
 
     pContext->EmitCs([this,
       cFrameId     = FrameId,
@@ -386,7 +500,8 @@ namespace dxvk {
       cReflexFrameId      = pContext->m_rtx.GetReflexFrameId(),
       cAcquiredImageIndex = imageIndex,
       // NV-DXVK end
-      cCommandList = m_context->endRecording()
+      cCommandList = m_context->endRecording(),
+      cPresentStatus = &m_presentStatusSlots[m_presentSlot]
     ] (DxvkContext* ctx) {
       m_device->submitCommandList(cCommandList,
         cSync.acquire, cSync.present);
@@ -397,7 +512,7 @@ namespace dxvk {
       if (cHud != nullptr && !cFrameId)
         cHud->update(1);
 
-      m_device->presentImage(cReflexFrameId, true, cAcquiredImageIndex, m_presenter, &m_presentStatus);
+      m_device->presentImage(cReflexFrameId, true, cAcquiredImageIndex, m_presenter, cPresentStatus);
       // NV-DXVK end
     });
 
@@ -406,9 +521,24 @@ namespace dxvk {
 
 
   void D3D11SwapChain::SynchronizePresent() {
-    // Recreate swap chain if the previous present call failed
-    VkResult status = m_device->waitForSubmission(&m_presentStatus);
-    
+    // NV-DXVK start: DLFG integration
+    // DxvkDLFGPresenter owns its acquisition and presents from its own thread,
+    // so the serialisation below does not apply to it. Waiting here anyway makes
+    // each rendered frame block on the interpolated present that follows it,
+    // which is worse than not interpolating at all.
+    if (m_usingDlfgPresenter)
+      return;
+    // NV-DXVK end
+
+    // NV-DXVK start: Serialize the single-acquire Vulkan presenter
+    // presentImage advances the presenter's shared image/semaphore indices and
+    // pre-acquires the next image on the submission thread. Its completion must
+    // precede acquireNextImage on this thread, even when GPU work overlaps.
+    m_presentSlot = 0;
+    // NV-DXVK end
+
+    VkResult status = m_device->waitForSubmission(&m_presentStatusSlots[m_presentSlot]);
+
     if (status != VK_SUCCESS)
       RecreateSwapChain(m_vsync);
   }
@@ -416,14 +546,22 @@ namespace dxvk {
 
   void D3D11SwapChain::RecreateSwapChain(BOOL Vsync) {
     // Ensure that we can safely destroy the swap chain
-    m_device->waitForSubmission(&m_presentStatus);
+    for (auto& status : m_presentStatusSlots) {
+      m_device->waitForSubmission(&status);
+      status.result = VK_SUCCESS;
+    }
     m_device->waitForIdle();
-
-    m_presentStatus.result = VK_SUCCESS;
 
     vk::PresenterDesc presenterDesc;
     presenterDesc.imageExtent     = { m_desc.Width, m_desc.Height };
     presenterDesc.imageCount      = PickImageCount(m_desc.BufferCount + 1);
+    // The ring the frame-generation presenter acquires from is sized only in
+    // CreatePresenter, so without this every swapchain recreation silently drops
+    // it back to the D3D11 buffer count and the game thread starts blocking on a
+    // shallower ring than it was given.
+    if (m_usingDlfgPresenter) {
+      presenterDesc.imageCount = PickDlfgImageCount(presenterDesc.imageCount);
+    }
     presenterDesc.numFormats      = PickFormats(m_desc.Format, presenterDesc.formats);
     presenterDesc.numPresentModes = PickPresentModes(Vsync, presenterDesc.presentModes);
     presenterDesc.fullScreenExclusive = PickFullscreenMode();
@@ -444,7 +582,32 @@ namespace dxvk {
 
 
   void D3D11SwapChain::CreatePresenter() {
-    DxvkDeviceQueue graphicsQueue = m_device->queues().graphics;
+    // NV-DXVK start: DLFG integration
+    // Frame generation produces its extra frames inside DxvkDLFGPresenter, which
+    // wraps the ordinary presenter and presents the interpolated image between
+    // two rendered ones. Without it the interpolation is computed and then
+    // dropped: isDLFGEnabled() answers true, setupFrameInterpolation runs every
+    // frame, and the swapchain still sees exactly one present per rendered
+    // frame. It also presents on the dedicated present queue rather than the
+    // graphics queue, as the D3D9 path does.
+    const bool dlfgEnabled = m_context != nullptr && m_context->isDLFGEnabled();
+    // DxvkAdapter picks this family without a surface, so its presentation
+    // support is never verified -- but it cannot be swapped for the graphics
+    // family to check: doing so takes the device out with VK_ERROR_DEVICE_LOST,
+    // because frame generation needs its own out-of-band present queue.
+    DxvkDeviceQueue graphicsQueue = dlfgEnabled ? m_device->queues().present : m_device->queues().graphics;
+    if (dlfgEnabled) {
+      // If these resolve to the same VkQueue, presents serialise against the
+      // renders behind them and no amount of swapchain or ring depth can
+      // pipeline the two.
+      const auto& gfx = m_device->queues().graphics;
+      Logger::info(str::format("[RTX.dlfg] present queue family ", graphicsQueue.queueFamily,
+        " handle ", reinterpret_cast<uintptr_t>(graphicsQueue.queueHandle),
+        " | graphics queue family ", gfx.queueFamily,
+        " handle ", reinterpret_cast<uintptr_t>(gfx.queueHandle),
+        " | distinct ", graphicsQueue.queueHandle != gfx.queueHandle ? 1 : 0));
+    }
+    // NV-DXVK end
 
     vk::PresenterDevice presenterDevice;
     presenterDevice.queueFamily   = graphicsQueue.queueFamily;
@@ -459,11 +622,34 @@ namespace dxvk {
     presenterDesc.numPresentModes = PickPresentModes(false, presenterDesc.presentModes);
     presenterDesc.fullScreenExclusive = PickFullscreenMode();
 
-    m_presenter = new vk::Presenter(m_window,
-      m_device->adapter()->vki(),
-      m_device->vkd(),
-      presenterDevice,
-      presenterDesc);
+    // NV-DXVK start: DLFG integration
+    if (dlfgEnabled) {
+      // DLFG presents one more frame per rendered frame, so the swapchain needs
+      // images for both. One extra is what the D3D9 path adds, but this path
+      // acquires from the game thread and blocked there for 16.4 ms a frame with
+      // that -- the whole of the frame-generation overhead was waiting for an
+      // image still on screen. Four is enough for a rendered frame, its
+      // interpolated partner, and one in flight.
+      presenterDesc.imageCount = PickDlfgImageCount(presenterDesc.imageCount);
+      Logger::info(str::format("[RTX.dlfg] backbuffer ring ", presenterDesc.imageCount));
+      Logger::info("[RTX.dlfg] D3D11 swapchain using the frame-generation presenter");
+      m_usingDlfgPresenter = true;
+      m_presenter = new DxvkDLFGPresenter(m_device,
+        m_context,
+        m_window,
+        m_device->adapter()->vki(),
+        m_device->vkd(),
+        presenterDevice,
+        presenterDesc);
+    } else {
+      m_usingDlfgPresenter = false;
+      m_presenter = new vk::Presenter(m_window,
+        m_device->adapter()->vki(),
+        m_device->vkd(),
+        presenterDevice,
+        presenterDesc);
+    }
+    // NV-DXVK end
     
     m_presenter->setFrameRateLimit(m_parent->GetOptions()->maxFrameRate);
     m_presenter->setFrameRateLimiterRefreshRate(m_displayRefreshRate);
@@ -644,6 +830,37 @@ namespace dxvk {
       maxFrameLatency = std::min(maxFrameLatency, m_frameLatencyCap);
 
     maxFrameLatency = std::min(maxFrameLatency, m_desc.BufferCount + 1);
+
+    // Deliberately NOT raised to match the requested present depth. Letting the
+    // CPU run further ahead here took the frame from 69 to 86 FPS and the GPU
+    // from 76% to 97% busy, because SyncFrameLatency is where the CPU is paced
+    // to the GPU. It also decouples when animation is sampled from when the
+    // frame is shown, and that reads as juddering water and juddering skinned
+    // models -- which is a worse frame than a slower one.
+    //
+    // Frame generation is the exception: it puts interpolation work between the
+    // rendered frame and its present, so pacing the CPU to the old depth stalls
+    // it behind work that did not exist before. The frame it adds is the one
+    // the feature already costs in latency by construction.
+    if (m_usingDlfgPresenter)
+      maxFrameLatency += 1;
+
+    // Measurement lever for how much of the frame is pacing rather than work.
+    // Depth is what decides whether the GPU ever runs ahead of the CPU here, so
+    // it has to be adjustable to attribute a frame that leaves the GPU idle.
+    const uint32_t extraDepth = RtxOptions::csExtraFrameLatency();
+    maxFrameLatency += extraDepth;
+
+    {
+      static uint32_t lastLogged = 0;
+      if (maxFrameLatency != lastLogged) {
+        lastLogged = maxFrameLatency;
+        Logger::info(str::format("[CSRemix] frame latency ", maxFrameLatency,
+          " (BufferCount ", m_desc.BufferCount, ", cap ", m_frameLatencyCap,
+          ", dlfg ", m_usingDlfgPresenter ? 1 : 0, ", extra ", extraDepth, ")"));
+      }
+    }
+
     return maxFrameLatency;
   }
 
@@ -702,6 +919,17 @@ namespace dxvk {
   }
 
 
+  uint32_t D3D11SwapChain::PickDlfgImageCount(uint32_t base) {
+    // One image per frame in a batch is the minimum that can be presented, not
+    // the number that lets the game thread run ahead. CS_REMIX_DLFG_IMAGES
+    // overrides it so the depth can be measured.
+    const uint32_t requested = std::max(base + 1u, 4u);
+    const char* v = std::getenv("CS_REMIX_DLFG_IMAGES");
+    const uint32_t override = v ? uint32_t(std::max(0, atoi(v))) : 0u;
+    return override ? std::max(override, 2u) : requested;
+  }
+
+
   uint32_t D3D11SwapChain::PickImageCount(
           UINT                      Preferred) {
     int32_t option = m_parent->GetOptions()->numBackBuffers;
@@ -710,6 +938,15 @@ namespace dxvk {
 
 
   VkFullScreenExclusiveEXT D3D11SwapChain::PickFullscreenMode() {
+    // Exclusive fullscreen hands the display to the driver, which can pace
+    // presents to scanout even with IMMEDIATE requested. vkQueuePresentKHR
+    // measures ~19 ms per call here, close to one refresh on this display, and
+    // no swapchain or pacing option moves it. This forces the composited path so
+    // that can be told apart from a genuine GPU wait.
+    static const bool kDisallowFse = std::getenv("CS_REMIX_NO_FSE") != nullptr;
+    if (kDisallowFse) {
+      return VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+    }
     return m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH
       ? VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT
       : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;

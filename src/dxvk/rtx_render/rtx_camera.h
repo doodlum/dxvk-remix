@@ -285,6 +285,13 @@ namespace dxvk
     // This must be called after any camera transform changes of the camera in a frame.
     // The transforms must not be externally updated further after applying this offset in the frame
     void applyArtificialWorldOffset(const Vector3& worldOffset);
+
+    // Re-expresses the previous frames' transforms in a world origin that has
+    // moved since they were recorded. A host that registers absolute transforms
+    // and has them rebased around a moving origin describes each frame in its
+    // own coordinates; without this the reprojection would read the change of
+    // coordinates as everything in the scene moving at once.
+    void rebasePreviousFrames(const Vector3& originDelta, bool includeCurrentFrame);
     const Vector3& getArtificialWorldOffset() const { return m_artificalWorldOffset; }
     const Vector3& getPreviousArtificialWorldOffset() const { return m_previousArtificalWorldOffset; }
 

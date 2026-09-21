@@ -124,7 +124,11 @@ bool isSubsurfaceDiffusionProfileMaterial(OpaqueSurfaceMaterialInteraction opaqu
 
 bool isThinOpaqueSubsurfaceMaterial(OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction)
 {
-  return opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction.measurementDistance > 0.0h && !isSubsurfaceDiffusionProfileMaterial(opaqueSurfaceMaterialInteraction);
+  // NV-DXVK start: Retained material records must honor the live thin-SSS switch.
+  return cb.sssArgs.enableThinOpaque &&
+    opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction.measurementDistance > 0.0h &&
+    opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction.maxSampleRadius == 0;
+  // NV-DXVK end
 }
 
 SubsurfaceMaterialInteraction subSurfaceMaterialReadHelper(

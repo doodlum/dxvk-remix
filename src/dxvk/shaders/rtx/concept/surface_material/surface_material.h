@@ -34,13 +34,9 @@ static const uint8_t translucentLobeTypeSpecularTransmission = uint8_t(1u);
 
 struct MemoryPolymorphicSurfaceMaterial
 {
-  // Note: Currently aligned nicely to 64 bytes, avoid changing the size of this structure. Note however since this is smaller
-  // than a L1 cacheline the actual size doesn't matter as much, so it is not heavily packed as the cache hitrate will be low
-  // and the random access nature does not facilitate much memory coalescing. Since this structure can fit in 64 bytes however
-  // it is best not to be too wasteful as this will align to L2's 32 byte cachelines better.
-
-  // Note: Keeping these as uint4 ensures 16 byte memory alignment, which is important for aligned vector loading.
-  uvec4 data[4];
+  // NV-DXVK start: Shared host/shader stride with 16-byte aligned vector loads.
+  uvec4 data[SURFACE_MATERIAL_GPU_SIZE / 16];
+  // NV-DXVK end
 
   bool isOpaque()
   {
@@ -99,15 +95,63 @@ struct OpaqueSurfaceMaterial
   // 26
   uint16_t samplerFeedbackStamp;
 
+  // 27-36: the five extra albedo then five extra normal layers a host's terrain
+  // blends between. Layer zero is the material's own albedo and normal, so only
+  // the additional five of each are carried here.
+  uint16_t nativeLandscapeTextureIndices[10];
+
+  // 37: bit per layer saying it was sampled in gamma space, with the top bit
+  // set to mark the material as terrain.
+  uint16_t nativeLandscapeFlags;
+
   // Todo: Fixed function blend state info here in the future (Actually this should go on a Legacy Material, or some sort of non-PBR Legacy Surface)
 
-  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[5];
+  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial).
+  // This has to span the whole 112 bytes: a host's effect recovers its block
+  // from the tail with reinterpret<NativeEffectStorage>, and a struct that
+  // stops short leaves every effect field, including the UV scale, reading zero.
+  // NV-DXVK start: Pad to the shared material record stride.
+  uint16_t data[(SURFACE_MATERIAL_GPU_SIZE - 76) / 2];
+  // NV-DXVK end
 
   bool hasValidDisplacement() {
     return flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT;
   }
 };
+
+// A host's animated effect, recovered from the tail of an opaque material by
+// reinterpret<>. It occupies the same bytes as the terrain layer indices; the
+// two are mutually exclusive and OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_EFFECT
+// says which is present. The prefix is the 64 bytes it does not claim.
+struct NativeEffectStorage {
+  uint4 prefix[4];
+  float2 uvOffset;
+  float2 uvScale;
+  float4 falloff;
+  float softDepth;
+  float propertyAlpha;
+  float16_t lightingInfluence;
+  uint16_t paletteIndex;
+  uint16_t paletteSampler;
+  uint16_t flags;
+};
+
+// NV-DXVK start: Mutually exclusive with effect/landscape material storage.
+struct NativeFoliageStorage
+{
+  uint4 prefix[4];
+  uint16_t softLightTexture;
+  uint16_t backLightTexture;
+  uint flags;
+  float rolloff;
+  float brightness;
+  float complexThreshold;
+  float colorGamma;
+  float diffuseScale;
+  float scatteringAmount;
+  uint4 padding;
+};
+// NV-DXVK end
 
 struct TranslucentSurfaceMaterial
 {
@@ -133,11 +177,35 @@ struct TranslucentSurfaceMaterial
   // 14-16
   f16vec3 emissiveColorConstant;
 
-  // 17
+  // 17-53: a host's water. The three scrolling normal layers are world space,
+  // not tangent space, and the flow fields are sampled through the projected
+  // UV basis in nativeWaterU/V. Meaningful only under
+  // TRANSLUCENT_SURFACE_MATERIAL_FLAG_NATIVE_WATER.
+  uint16_t nativeWaterNormal2;
+  uint16_t nativeWaterNormal3;
+  f16vec3 nativeWaterScale;
+  f16vec3 nativeWaterAmplitude;
+  f16vec2 nativeWaterScroll1;
+  f16vec2 nativeWaterScroll2;
+  f16vec2 nativeWaterScroll3;
+  uint16_t nativeWaterWading;
+  // Byte 64 onwards, so these land 4-byte aligned.
+  float3 nativeWaterU;
+  float3 nativeWaterV;
+  f16vec4 nativeWaterCell;
+  float16_t nativeWaterDimension; // negative means native BLEND_NORMALS
+  uint16_t nativeWaterFlowAtlas;
+  uint16_t nativeWaterFlowNormal;
+  uint16_t nativeWaterFlowSampler;
+  float nativeWaterTime;
+
+  // 54
   uint16_t samplerFeedbackStamp;
 
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[14];
+  // NV-DXVK start: Pad to the shared material record stride.
+  uint16_t data[(SURFACE_MATERIAL_GPU_SIZE - 110) / 2];
+  // NV-DXVK end
 };
 
 struct RayPortalSurfaceMaterial
@@ -155,7 +223,9 @@ struct RayPortalSurfaceMaterial
   uint16_t samplerIndex2;
 
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[24];
+  // NV-DXVK start: Pad to the shared material record stride.
+  uint16_t data[(SURFACE_MATERIAL_GPU_SIZE - 16) / 2];
+  // NV-DXVK end
 
 };
 
@@ -175,7 +245,9 @@ struct SubsurfaceMaterial
   float16_t maxSampleRadius;
   
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[19];
+  // NV-DXVK start: Pad to the shared material record stride.
+  uint16_t data[(SURFACE_MATERIAL_GPU_SIZE - 26) / 2];
+  // NV-DXVK end
 };
 
 struct SubsurfaceMaterialInteraction
@@ -203,6 +275,8 @@ struct OpaqueSurfaceMaterialInteraction
   // Note: A value of 0 in the thin film thickness indicates the thin film is disabled.
   float thinFilmThickness;
   uint8_t flags;
+
+  // An instance-up diffuse lighting proxy, not an oriented blade surface.
 };
 
 struct DecalMaterialInteraction

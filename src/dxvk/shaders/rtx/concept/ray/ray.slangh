@@ -191,9 +191,10 @@ Ray rayCreatePositionSubsurface(
   const vec3 direction = safeNormalize(rayVector, vec3(0.0f, 0.0f, 1.0f));
   const float tMax = length(rayVector);
 
-  // If the new tracing ray is on the other side of SSS surface, treat the surface as penetrateSurface 
-  const float NoR = dot(shadingNormal, direction);
+  // NV-DXVK start: Choose the offset side from the plane used by the offset itself.
+  const float NoR = dot(minimalSurfaceInteraction.geometryNormal, direction);
   const bool penetrateSurface = NoR <= 0.0f;
+  // NV-DXVK end
 
   return rayCreateInternal(minimalRayInteraction, minimalSurfaceInteraction, viewRay, direction, tMax, penetrateSurface);
 }

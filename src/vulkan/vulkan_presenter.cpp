@@ -29,6 +29,84 @@
 
 namespace dxvk::vk {
 
+  // NV-DXVK start: presenter surface state for external frame generation
+  // Community Shaders' frame-generation path has to know the format and colour
+  // space the swapchain actually ended up with, and has to be able to tell that
+  // a transition it asked for has landed. Both DLSS-G and FSR-FG hand images to
+  // a proxy presenter, so they cannot be allowed to run against a surface whose
+  // encoding is still changing. The serial increments on every successful
+  // swapchain creation, which is what lets the host wait for its request to
+  // settle rather than guessing.
+  struct PresenterSurfaceStateSnapshot {
+    uint64_t serial = 0;
+    uint32_t format = 0;
+    uint32_t requestedColorSpace = 0;
+    uint32_t effectiveColorSpace = 0;
+  };
+
+  static std::mutex g_dxvkPresenterSurfaceStateMutex;
+  static PresenterSurfaceStateSnapshot g_dxvkPresenterSurfaceState;
+
+  extern "C" uint64_t dxvkGetPresenterSurfaceState(
+          uint32_t* format,
+          uint32_t* requestedColorSpace,
+          uint32_t* effectiveColorSpace) {
+    std::lock_guard lock(g_dxvkPresenterSurfaceStateMutex);
+
+    if (!g_dxvkPresenterSurfaceState.serial)
+      return 0;
+
+    if (format)
+      *format = g_dxvkPresenterSurfaceState.format;
+    if (requestedColorSpace)
+      *requestedColorSpace = g_dxvkPresenterSurfaceState.requestedColorSpace;
+    if (effectiveColorSpace)
+      *effectiveColorSpace = g_dxvkPresenterSurfaceState.effectiveColorSpace;
+
+    return g_dxvkPresenterSurfaceState.serial;
+  }
+
+  static void publishPresenterSurfaceState(
+          VkFormat format,
+          VkColorSpaceKHR requestedColorSpace,
+          VkColorSpaceKHR effectiveColorSpace) {
+    std::lock_guard lock(g_dxvkPresenterSurfaceStateMutex);
+
+    g_dxvkPresenterSurfaceState.serial += 1;
+    g_dxvkPresenterSurfaceState.format = uint32_t(format);
+    g_dxvkPresenterSurfaceState.requestedColorSpace = uint32_t(requestedColorSpace);
+    g_dxvkPresenterSurfaceState.effectiveColorSpace = uint32_t(effectiveColorSpace);
+  }
+
+  // One-shot request to recreate the Vulkan swapchain on the next acquire. The
+  // host uses it when switching frame-generation method: sl.dlss_g installs a
+  // sticky present proxy that bypasses the Vulkan present hooks, so FSR never
+  // returns VK_SUBOPTIMAL to trigger a recreate on its own.
+  std::atomic<bool> g_dxvkForceSwapchainRecreate = { false };
+
+  extern "C" void dxvkRequestSwapchainRecreate() {
+    g_dxvkForceSwapchainRecreate.store(true, std::memory_order_release);
+  }
+
+  // Invoked while no swapchain exists -- after destroy, before create. Returning
+  // false leaves the presenter empty so an external wrapper that failed teardown
+  // cannot overlap a replacement; the attempt repeats on the next recreation.
+  std::atomic<bool (*)()> g_dxvkSwapchainTornDownCallback = { nullptr };
+
+  extern "C" void dxvkSetSwapchainTornDownCallback(bool (*cb)()) {
+    g_dxvkSwapchainTornDownCallback.store(cb, std::memory_order_release);
+  }
+
+  static bool notifySwapchainTornDown() {
+    if (auto cb = g_dxvkSwapchainTornDownCallback.load(std::memory_order_acquire); cb && !cb()) {
+      Logger::err("Presenter: External swapchain teardown incomplete; deferring recreation.");
+      return false;
+    }
+    return true;
+  }
+  // NV-DXVK end
+
+
   Presenter::Presenter(
           HWND            window,
     const Rc<InstanceFn>& vki,
@@ -123,6 +201,30 @@ namespace dxvk::vk {
     // NV-DXVK end
   ) {
     ScopedCpuProfileZone();
+    // NV-DXVK start: presented-rate counter
+    // The host's frame counter only advances for rendered frames, so it cannot
+    // tell whether frame generation is actually reaching the display. This
+    // counts what the swapchain is really asked to present, split by whether
+    // DLFG produced it.
+    {
+      static std::mutex rateMutex;
+      static std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+      static uint32_t presented = 0;
+      static uint32_t interpolated = 0;
+      std::lock_guard lock(rateMutex);
+      ++presented;
+      interpolated += isDlfgPresenting ? 1u : 0u;
+      const auto now = std::chrono::steady_clock::now();
+      const double elapsed = std::chrono::duration<double>(now - windowStart).count();
+      if (elapsed >= 2.0) {
+        Logger::info(str::format("[RTX.present] ", presented / elapsed, " presents/s (",
+          interpolated / elapsed, " interpolated/s, ", (presented - interpolated) / elapsed, " rendered/s)"));
+        windowStart = now;
+        presented = 0;
+        interpolated = 0;
+      }
+    }
+    // NV-DXVK end
     // NV-DXVK start: DLFG integration
     PresenterSync sync;
     
@@ -145,7 +247,24 @@ namespace dxvk::vk {
     // NV-DXVK end
     info.pResults           = nullptr;
 
+    // Splits the present-thread job's ~17 ms per present between the driver call
+    // itself and everything this function does around it. Everything upstream of
+    // here has been measured; this is the last unattributed step.
+    const auto queuePresentStart = std::chrono::steady_clock::now();
     VkResult status = m_vkd->vkQueuePresentKHR(m_device.queue, &info);
+    {
+      static std::mutex qpMutex;
+      static double total = 0.0;
+      static uint32_t samples = 0;
+      std::lock_guard lock(qpMutex);
+      total += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - queuePresentStart).count();
+      if (++samples % 240 == 0) {
+        Logger::info(str::format("[RTX.queuepresent] vkQueuePresentKHR ", total / 240.0,
+          " ms per call (mean of 240)"));
+        total = 0.0;
+      }
+    }
 
     if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
       return status;
@@ -179,8 +298,18 @@ namespace dxvk::vk {
 
   
   VkResult Presenter::recreateSwapChain(const PresenterDesc& desc) {
+    // NV-DXVK start: external frame-generation interop
+    g_dxvkForceSwapchainRecreate.store(false, std::memory_order_release);
+    // NV-DXVK end
     if (m_swapchain)
       destroySwapchain();
+
+    // NV-DXVK start: external frame-generation interop
+    // The swapchain is gone at this point, which is the only moment an external
+    // presenter proxy can be torn down without overlapping its replacement.
+    if (!notifySwapchainTornDown())
+      return VK_NOT_READY;
+    // NV-DXVK end
 
     // Query surface capabilities. Some properties might
     // have changed, including the size limits and supported
@@ -214,6 +343,12 @@ namespace dxvk::vk {
 
     // Select actual swap chain properties and create swap chain
     m_info.format       = pickFormat(formats.size(), formats.data(), desc.numFormats, desc.formats);
+    // NV-DXVK start: the first desired entry is what the caller asked for; the
+    // picked one is what the surface supports. Publishing both lets the host see
+    // a request that could not be honoured instead of waiting for it forever.
+    const VkColorSpaceKHR requestedColorSpace = desc.numFormats
+      ? desc.formats[0].colorSpace : m_info.format.colorSpace;
+    // NV-DXVK end
     m_info.presentMode  = pickPresentMode(modes.size(), modes.data(), desc.numPresentModes, desc.presentModes);
     m_info.imageExtent  = pickImageExtent(caps, desc.imageExtent);
     m_info.imageCount   = pickImageCount(caps, m_info.presentMode, desc.imageCount);
@@ -307,6 +442,10 @@ namespace dxvk::vk {
 
     // NV-DXVK start: App Controlled FSE
     acquireFullscreenExclusive();
+    // NV-DXVK end
+
+    // NV-DXVK start: presenter surface state for external frame generation
+    publishPresenterSurfaceState(m_info.format.format, requestedColorSpace, m_info.format.colorSpace);
     // NV-DXVK end
 
     // Acquire images and create views

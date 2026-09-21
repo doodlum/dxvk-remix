@@ -435,6 +435,10 @@ namespace dxvk {
     dxvk::condition_variable    m_condOnAdd;
     dxvk::condition_variable    m_condOnSync;
     std::queue<DxvkCsChunkRef>  m_chunksQueued;
+
+    // Starvation accounting for the loop in threadFunc; see the counter there.
+    double                      m_csIdleMs = 0.0;
+    std::chrono::steady_clock::time_point m_csWindowStart = std::chrono::steady_clock::now();
     dxvk::thread                m_thread;
     
     void threadFunc();

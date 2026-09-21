@@ -46,6 +46,7 @@ class CameraManager;
 
 // RtInstance defines a SceneObjects placement/parameterization within the current scene.
 class RtInstance {
+  friend class InstanceRetirementTest;
 public:
   RtSurface surface;
 
@@ -118,6 +119,11 @@ public:
   bool move(const Matrix4& objectToWorld);
   // Move to the new transform without changing history (call if the transform is changed multiple times per frame)
   bool moveAgain(const Matrix4& objectToWorld);
+  // Shifts the instance into a moved rebasing origin. This is a change of frame
+  // of reference, not of the scene: the transform and its history move together
+  // and the orientation is untouched, so nothing reports motion. The cameras are
+  // rebased to match by CameraManager::rebasePreviousFrames.
+  void rebaseBy(const Vector3& originDelta);
 
   void setFrameCreated(const uint32_t frameIndex);
   // Returns if this is the first occurence in a given frame
@@ -183,6 +189,21 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
   // (transform, material, or geometry change).  New instances default to dirty.
   bool isBlasDirty() const { return m_blasDirty; }
   void clearBlasDirty() { m_blasDirty = false; }
+  // Which cached BLAS bucket this instance belongs to. Held on the instance
+  // rather than in a side map because mergeInstancesIntoBlas queries it once per
+  // instance every frame, and a hash lookup keyed on the instance pointer costs
+  // more than the check it guards. The generation stamp is what makes a stale
+  // index unreadable, so the field never has to be cleared in bulk.
+  void setBucketCache(uint64_t generation, uint32_t bucketIndex) {
+    m_bucketCacheGeneration = generation;
+    m_bucketCacheIndex = bucketIndex;
+  }
+  void invalidateBucketCache() { m_bucketCacheGeneration = 0; }
+  bool hasBucketCache(uint64_t generation) const {
+    return m_bucketCacheGeneration == generation && generation != 0;
+  }
+  uint32_t getBucketCacheIndex() const { return m_bucketCacheIndex; }
+
   bool isBillboardGeometryDirty() const { return m_billboardGeometryDirty; }
   void clearBillboardGeometryDirty() { m_billboardGeometryDirty = false; }
 
@@ -248,6 +269,8 @@ private:
   bool m_isCreatedByRenderer = false;
   bool m_isSubsurface = false;
   bool m_blasDirty = true;  // Needs reprocessing in mergeInstancesIntoBlas; starts dirty for new instances
+  uint64_t m_bucketCacheGeneration = 0;  // Zero means this instance is in no cached bucket
+  uint32_t m_bucketCacheIndex = 0;
   bool m_billboardGeometryDirty = true;  // Needs initial geometry info generation for billboard-derived layout
   BlasEntry* m_linkedBlas = nullptr;
   XXH64_hash_t m_materialHash = kEmptyHash;
@@ -314,6 +337,7 @@ struct IntersectionBillboard {
 // InstanceManager is responsible for maintaining the active set of scene instances
 //  and the GPU buffers which are required by VK for instancing.
 class InstanceManager : public CommonDeviceObject {
+  friend class InstanceRetirementTest;
 public:
   InstanceManager(InstanceManager const&) = delete;
   InstanceManager& operator=(InstanceManager const&) = delete;
@@ -426,6 +450,12 @@ private:
   std::vector<RtInstance*> m_playerModelInstances;
   uint32_t m_playerModelInstancesFrameId = kInvalidFrameIndex;
   std::vector<IntersectionBillboard> m_billboards;
+  // RtxOption accessors take a global mutex on every read. The billboard refresh
+  // below runs once per preserved instance -- around eight thousand times a
+  // frame in a Skyrim exterior -- and the value cannot change mid-frame, so it
+  // is read once per frame and reused.
+  uint32_t m_unorderedApproximationsFrame = UINT32_MAX;
+  bool m_unorderedApproximationsEnabled = false;
 
   RtInstance* targetInstance = nullptr;
 
@@ -450,7 +480,8 @@ private:
   // Removes any persistent map entry (key or value) that references a
   // dying instance.  Called from garbageCollection() before the instance
   // is deleted to prevent dangling pointers.
-  void erasePersistentMapEntries(RtInstance* dying);
+  // Returns the earliest vector slot newly marked for collection, or UINT32_MAX.
+  uint32_t erasePersistentMapEntries(RtInstance* dying);
 
 #ifndef NDEBUG
   std::deque<void*> m_destroyedInstanceQuarantine;

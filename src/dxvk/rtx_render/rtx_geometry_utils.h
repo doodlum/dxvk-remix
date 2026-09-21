@@ -73,6 +73,11 @@ namespace dxvk {
      */
     void dispatchSkinning(const DrawCallState& drawCallState, const RaytraceGeometry& geo);
 
+    // Expand retained grass placements once, update exact painted-weight wind
+    // vertices on the GPU, and expose stable topology to the normal BLAS cache.
+    bool deformNativeGrass(Rc<DxvkContext> ctx, RasterGeometry& geometry,
+      NativeInstanceSet& placements, const Vector4& wind);
+
     /**
      * \brief Execute a compute shader to perform view model perspective correction
      */
@@ -203,6 +208,9 @@ namespace dxvk {
         m_skinningContext->flushCommandList();
       }
     }
+
+    // Opt-in bounded validation after uploads/skinning, before ray tracing.
+    void probeSkinning(const Rc<DxvkContext>& ctx);
 
   private:
     static uint32_t calculateNumMicroTrianglesToBake(const BakeOpacityMicromapState& bakeState, const BakeOpacityMicromapDesc& desc, const uint32_t allowedNumMicroTriangleAlignment, const float bakingWeightScale, uint32_t& availableBakingBudget);

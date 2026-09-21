@@ -182,12 +182,30 @@ namespace dxvk {
             chunk = DxvkCsChunkRef();
           }
           
+          // NV-DXVK start: command-stream thread starvation counter
+          // Whether this thread is starved or saturated decides whether the
+          // frame's serial chain can be pipelined at all: starved means the game
+          // thread is the limiter, saturated means this thread is.
           if (m_chunksQueued.size() == 0) {
+            const auto idleStart = std::chrono::steady_clock::now();
             m_condOnAdd.wait(lock, [this] {
               return (m_chunksQueued.size() != 0)
                   || (m_stopped.load());
             });
+            m_csIdleMs += std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - idleStart).count();
           }
+          {
+            const auto now = std::chrono::steady_clock::now();
+            const double window = std::chrono::duration<double>(now - m_csWindowStart).count();
+            if (window >= 2.0) {
+              Logger::info(str::format("[RTX.csthread] idle ", 100.0 * m_csIdleMs / (window * 1000.0),
+                "% of wall, queued chunks ", m_chunksQueued.size()));
+              m_csIdleMs = 0.0;
+              m_csWindowStart = now;
+            }
+          }
+          // NV-DXVK end
           
           if (m_chunksQueued.size() != 0) {
             chunk = std::move(m_chunksQueued.front());

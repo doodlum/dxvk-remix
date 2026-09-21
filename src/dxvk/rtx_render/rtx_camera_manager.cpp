@@ -45,6 +45,15 @@ namespace dxvk {
     m_decompositionCache.clear();
   }
 
+  void CameraManager::rebasePreviousFrames(const Vector3& originDelta, uint32_t frameId) {
+    for (auto& camera : m_cameras) {
+      if (camera.getLastUpdateFrame() == kInvalidFrameIndex) {
+        continue;
+      }
+      camera.rebasePreviousFrames(originDelta, camera.getLastUpdateFrame() != frameId);
+    }
+  }
+
   CameraType::Enum CameraManager::processCameraData(const DrawCallState& input) {
     // If theres no real camera data here - bail
     if (isIdentityExact(input.getTransformData().viewToProjection)) {

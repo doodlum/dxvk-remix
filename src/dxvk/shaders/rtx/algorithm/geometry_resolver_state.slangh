@@ -38,13 +38,19 @@ struct GeometryResolverState : IBasePayloadState
   // so they can be accumulated into in the geometry resolving loop.
   vec3 radiance;
   float _segmentHitDistance;
+  // NV-DXVK start: Absolute hardware T, separate from the current shading segment.
+  float resolveRayT;
+  bool continueOriginalRay;
+  // NV-DXVK end
 
   // Note: This represents the quaternion to transform a normal or vector from world space into the virtual space seen
   // through PSR and ray portals.
   f16vec4 _accumulatedRotation;
   float accumulatedHitDistance;
   
-  f16vec3 _direction;
+  // NV-DXVK start: Retain the direction used for the hardware hit.
+  vec3 _direction;
+  // NV-DXVK end
   f16vec3 attenuation;
   uint8_t _rayMask;
 
@@ -80,7 +86,9 @@ struct GeometryResolverState : IBasePayloadState
   property vec3 direction
   {
     get { return _direction; }
-    set { _direction = f16vec3(newValue); }
+    // NV-DXVK start: Preserve continuation-ray precision.
+    set { _direction = newValue; }
+    // NV-DXVK end
   }
 
   property uint8_t rayMask 
@@ -215,12 +223,18 @@ struct GeometryPSRResolverState : IBasePayloadState
   // so they can be accumulated into in the geometry PSR resolving loop.
   vec3 radiance;
   float _segmentHitDistance;
+  // NV-DXVK start: Absolute hardware T, separate from the current shading segment.
+  float resolveRayT;
+  bool continueOriginalRay;
+  // NV-DXVK end
   
   f16vec4 _accumulatedRotation;
   float accumulatedHitDistance;
   uint mediumMaterialIndex;
   
-  f16vec3 _direction;
+  // NV-DXVK start: Retain the direction used for the hardware hit.
+  vec3 _direction;
+  // NV-DXVK end
   uint8_t _rayMask;
   uint8_t bounceIteration;
   f16vec3 attenuation;
@@ -263,7 +277,9 @@ struct GeometryPSRResolverState : IBasePayloadState
   property vec3 direction
   {
     get { return _direction; }
-    set { _direction = f16vec3(newValue); }
+    // NV-DXVK start: Preserve continuation-ray precision.
+    set { _direction = newValue; }
+    // NV-DXVK end
   }
 
   property uint8_t rayMask 

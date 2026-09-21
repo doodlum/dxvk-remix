@@ -46,6 +46,28 @@ static const uint numDecalResolveBins = 4;
 
 // Resolve Helper Functions
 
+bool resolveNativeEffectSoftness(OpaqueSurfaceMaterial material, Ray ray, float hitDistance,
+                                inout SurfaceInteraction interaction)
+{
+  if ((material.flags & OPAQUE_SURFACE_MATERIAL_FLAG_NATIVE_EFFECT) == 0)
+  {
+    return false;
+  }
+
+  const NativeEffectStorage effect = reinterpret<NativeEffectStorage>(material);
+  if ((effect.flags & 256) != 0)
+  {
+    // Secondary rays use a ray-local gap; only camera rays reproduce native view depth.
+    float viewDepthScale = 1.0f;
+#ifdef RAY_TRACING_PRIMARY_RAY
+    viewDepthScale = abs(mul(cb.camera.worldToView, vec4(ray.direction, 0.0f)).z);
+#endif
+    interaction.nativeEffectSoftOpacity = nativeEffectSoftIntersection(
+      ray.tMax - hitDistance, viewDepthScale, effect.softDepth);
+  }
+  return true;
+}
+
 bool isRayMaskEmpty(uint8_t rayMask)
 {
   return rayMask == 0;
@@ -239,6 +261,38 @@ bool evaluateTranslucentApproximations(
 
 // Resolve Functions
 
+// NV-DXVK start: Shade each interval once while tracing along an unchanged ray.
+void beginResolveSegment<T : IBasePayloadState>(inout RayHitInfo hit, inout T state)
+{
+  if (hit.hasHit)
+  {
+    const float absoluteT = hit.hitDistance;
+    hit.hitDistance = max(absoluteT - state.resolveRayT, 0.0f);
+    state.resolveRayT = absoluteT;
+  }
+}
+
+bool advanceResolveRay<T : IBasePayloadState>(inout RayDesc hardwareRay, inout T state)
+{
+  if (state.continueOriginalRay)
+  {
+    hardwareRay.TMin = asfloat(asuint(state.resolveRayT) + 1u);
+    // Shading/attenuation uses the new segment; hardware traversal keeps its origin.
+    state.origin = hardwareRay.Origin + state.resolveRayT * hardwareRay.Direction;
+  }
+  else
+  {
+    // A portal establishes a new coordinate frame and a new hardware ray.
+    hardwareRay.TMax = max(hardwareRay.TMax - state.resolveRayT, 0.0f);
+    hardwareRay.Origin = state.origin;
+    hardwareRay.Direction = state.direction;
+    hardwareRay.TMin = 0.0f;
+    state.resolveRayT = 0.0f;
+  }
+  return hardwareRay.TMin <= hardwareRay.TMax;
+}
+// NV-DXVK end
+
 // Handles updating of the resolve state after each iteration when resolving is intended to continue.
 // Mainly used to update ray origin and teleport through Ray Portals.
 void resolveVertexFinalContinue<T : IBasePayloadState>(
@@ -250,17 +304,18 @@ void resolveVertexFinalContinue<T : IBasePayloadState>(
 
   if (teleport)
   {
+    // NV-DXVK start: Portal continuation cannot retain the incoming ray line.
+    resolveVertexState.continueOriginalRay = false;
+    // NV-DXVK end
     // Teleport matrix already includes ray offset to avoid self-intersection with the exit portal
     resolveVertexState.origin = (mul(teleportMatrix, vec4(surfaceInteraction.position, 1.0f))).xyz;
     resolveVertexState.direction = normalize(mul(mat3(teleportMatrix), vec3(resolveVertexState.direction)));
   }
   else
   {
-    // Note: This will cause slight floating point error along the ray as the origin is shifted around without updating the direction,
-    // but it is likely fine. Ideally the tMin value instead could just be updated, but the hardware may not start the ray at tMin, resulting in excessive work.
-    // Note: Triangle normal always faces the viewer, so using it negated will always allow the ray to be pushed through the triangle hit. This is important to properly offset
-    // the ray to allow it to continue, using the ray direction instead will not work on triangles at a grazing angle.
-    resolveVertexState.origin = rayOffsetSurfaceOriginHelper(surfaceInteraction, true);
+    // NV-DXVK start: A normal offset can skip adjacent transparent/skin layers.
+    resolveVertexState.continueOriginalRay = true;
+    // NV-DXVK end
   }
 }
 
@@ -994,10 +1049,12 @@ void resolveVertexUnorderedParticles<
     float currentRadianceAttenuation = 1.0f;
     vec3 currentEmissiveRadiance = vec3(0.0f);
     bool handledInteraction = false;
+    bool nativeEffect = false;
 
     if (polymorphicType == surfaceMaterialTypeOpaque)
     {
       const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
+      nativeEffect = resolveNativeEffectSoftness(opaqueSurfaceMaterial, ray, rayHitInfo.hitDistance, surfaceInteraction);
 
       const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
         opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
@@ -1028,7 +1085,7 @@ void resolveVertexUnorderedParticles<
     }
 
     const float softBlendFactor = saturate((ray.tMax - rayHitInfo.hitDistance) / (ray.tMax * uint16BitsToF32(cb.particleSoftnessFactor)));
-    const float blendFactor = surface.isParticle ? softBlendFactor : 1.0f;
+    const float blendFactor = surface.isParticle && !nativeEffect ? softBlendFactor : 1.0f;
 
     currentRadianceAttenuation = mix(1.0f, currentRadianceAttenuation, blendFactor);
     currentEmissiveRadiance = mix(vec3(0.0f), currentEmissiveRadiance, blendFactor);
@@ -1369,10 +1426,15 @@ void resolveVertexUnordered<
 
     const bool isDecal = isTriangle && surfaceIsDecal(surface);
     bool handledInteraction = false;
+    bool nativeEffect = false;
 
     if (polymorphicType == surfaceMaterialTypeOpaque)
     {
       const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
+      if (!isDecal)
+      {
+        nativeEffect = resolveNativeEffectSoftness(opaqueSurfaceMaterial, ray, rayHitInfo.hitDistance, surfaceInteraction);
+      }
 
       const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
         opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
@@ -1463,7 +1525,7 @@ void resolveVertexUnordered<
       // fading out portions of particles closer to walls. Only done for Surfaces labeled as particles.
 
       const float softBlendFactor = saturate((ray.tMax - rayHitInfo.hitDistance) / (ray.tMax * uint16BitsToF32(cb.particleSoftnessFactor)));
-      const float blendFactor = surface.isParticle ? softBlendFactor : 1.0f;
+      const float blendFactor = surface.isParticle && !nativeEffect ? softBlendFactor : 1.0f;
 
       currentRadianceAttenuation = mix(1.0f, currentRadianceAttenuation, blendFactor);
       currentEmissiveRadiance = mix(vec3(0.0f), currentEmissiveRadiance, blendFactor);
